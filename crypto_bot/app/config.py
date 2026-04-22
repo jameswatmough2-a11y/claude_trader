@@ -20,6 +20,7 @@ class Settings:
     max_position_pct: float = field(default_factory=lambda: float(os.getenv("MAX_POSITION_PCT", "20")))
     max_total_exposure_pct: float = field(default_factory=lambda: float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "60")))
     stop_loss_pct: float = field(default_factory=lambda: float(os.getenv("STOP_LOSS_PCT", "5")))
+    take_profit_pct: float = field(default_factory=lambda: float(os.getenv("TAKE_PROFIT_PCT", "0")))
 
     def __post_init__(self) -> None:
         raw = os.getenv("TRACKED_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT")

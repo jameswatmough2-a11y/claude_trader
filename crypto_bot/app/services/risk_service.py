@@ -30,10 +30,12 @@ class RiskCheck:
 
 
 class RiskService:
-    """Tracks open positions in memory and enforces risk rules on trading decisions."""
+    """Tracks open positions in memory and enforces all risk rules."""
 
     def __init__(self) -> None:
         self._positions: dict[str, OpenPosition] = {}
+
+    # ── Position state ─────────────────────────────────────────────────────────
 
     def record_open_position(self, asset: str, entry_price: float, size_pct: float) -> None:
         asset = asset.upper()
@@ -49,18 +51,13 @@ class RiskService:
         if self._positions.pop(asset.upper(), None):
             logger.info("Closed position: %s", asset.upper())
 
-    def update_current_prices(self, market_data: dict[str, Any]) -> None:
-        for asset, pos in self._positions.items():
-            md = market_data.get(asset, {})
-            price = md.get("last_price")
-            if price is not None:
-                pos.current_price = float(price)
+    def get_open_positions(self) -> dict[str, OpenPosition]:
+        return dict(self._positions)
 
     def get_total_exposure_pct(self) -> float:
         return sum(p.size_pct for p in self._positions.values())
 
-    def get_open_positions(self) -> dict[str, OpenPosition]:
-        return dict(self._positions)
+    # ── Hourly cycle: evaluate a single AI decision ────────────────────────────
 
     def evaluate_decision(self, decision: dict[str, Any], current_price: float) -> RiskCheck:
         asset = decision["asset"].upper()
@@ -73,7 +70,17 @@ class RiskService:
             return RiskCheck(False, reason, self._to_hold(decision, reason))
 
         if action == "HOLD":
-            return RiskCheck(True, "HOLD — no action needed.", {**decision, "action": "HOLD", "size_pct": 0})
+            return RiskCheck(True, "HOLD — no action.", {**decision, "action": "HOLD", "size_pct": 0})
+
+        # Entry guard: prevent buying into an existing position
+        if action == "BUY" and asset in self._positions:
+            reason = f"Already holding {asset} — skipping BUY to avoid stacking."
+            return RiskCheck(True, reason, self._to_hold(decision, reason))
+
+        # Exit guard: prevent selling a position we don't hold
+        if action == "SELL" and asset not in self._positions:
+            reason = f"No open position for {asset} — ignoring SELL."
+            return RiskCheck(True, reason, self._to_hold(decision, reason))
 
         if confidence < settings.min_confidence:
             reason = f"Confidence {confidence:.2f} below minimum {settings.min_confidence:.2f} — forcing HOLD."
@@ -99,28 +106,61 @@ class RiskService:
             {**decision, "asset": asset, "action": action, "size_pct": int(size_pct)},
         )
 
+    # ── Real-time exit check (called on every WebSocket tick) ──────────────────
+
+    def check_exit_conditions(self, symbol: str, price: float) -> dict[str, Any] | None:
+        """Check a single symbol for stop-loss or take-profit breach.
+
+        Removes the position immediately when triggered to prevent double-execution
+        on subsequent ticks before the order is filled.
+        Returns a SELL order dict if triggered, None otherwise.
+        """
+        pos = self._positions.get(symbol.upper())
+        if pos is None or pos.entry_price <= 0:
+            return None
+
+        pos.current_price = price
+        drawdown_pct = (pos.entry_price - price) / pos.entry_price * 100
+        gain_pct = (price - pos.entry_price) / pos.entry_price * 100
+
+        reason: str | None = None
+        if drawdown_pct >= settings.stop_loss_pct:
+            reason = (
+                f"Stop-loss: price fell {drawdown_pct:.2f}% below entry "
+                f"(threshold: {settings.stop_loss_pct}%)"
+            )
+        elif settings.take_profit_pct > 0 and gain_pct >= settings.take_profit_pct:
+            reason = (
+                f"Take-profit: price rose {gain_pct:.2f}% above entry "
+                f"(threshold: {settings.take_profit_pct}%)"
+            )
+
+        if reason:
+            size_pct = int(pos.size_pct)
+            del self._positions[symbol.upper()]  # prevent re-trigger on next tick
+            logger.warning("Exit triggered for %s: %s", symbol, reason)
+            return {
+                "asset": symbol.upper(),
+                "action": "SELL",
+                "confidence": 1.0,
+                "size_pct": size_pct,
+                "reasoning": reason,
+                "trigger_price": price,
+            }
+        return None
+
+    # ── Hourly cycle: batch exit check across all positions ────────────────────
+
     def check_stop_losses(self, market_data: dict[str, Any]) -> list[dict[str, Any]]:
-        self.update_current_prices(market_data)
-        stop_orders: list[dict[str, Any]] = []
-
-        for asset, pos in list(self._positions.items()):
-            if pos.entry_price <= 0 or pos.current_price <= 0:
-                continue
-            drawdown_pct = (pos.entry_price - pos.current_price) / pos.entry_price * 100
-            if drawdown_pct >= settings.stop_loss_pct:
-                logger.warning("Stop-loss triggered for %s: %.2f%% drawdown", asset, drawdown_pct)
-                stop_orders.append({
-                    "asset": asset,
-                    "action": "SELL",
-                    "confidence": 1.0,
-                    "size_pct": int(pos.size_pct),
-                    "reasoning": (
-                        f"Stop-loss: price fell {drawdown_pct:.2f}% from entry "
-                        f"(threshold: {settings.stop_loss_pct}%)."
-                    ),
-                })
-
-        return stop_orders
+        """Batch exit check used by the hourly cycle. Delegates per-symbol to check_exit_conditions."""
+        results: list[dict[str, Any]] = []
+        for symbol, md in market_data.items():
+            price = float(md.get("last_price", 0) or 0)
+            if price > 0:
+                order = self.check_exit_conditions(symbol, price)
+                if order:
+                    results.append(order)
+        return results
 
     def filter_decisions(
         self,
@@ -136,7 +176,6 @@ class RiskService:
             if asset in stop_assets:
                 final.append(next(o for o in stop_orders if o["asset"] == asset))
                 continue
-
             md = market_data.get(asset, {})
             current_price = float(md.get("last_price", 0) or 0)
             check = self.evaluate_decision({**decision, "asset": asset}, current_price)
