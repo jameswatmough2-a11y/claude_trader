@@ -14,15 +14,17 @@ from app.api.routes.health import router as health_router
 from app.api.routes.assets import router as assets_router
 from app.api.routes.positions import router as positions_router
 from app.api.routes.decisions import router as decisions_router
+from app.api.routes.market import router as market_router
 from app.config import settings
 from app.db.init_db import init_db
 from app.db.session import SessionLocal
-from app.services.binance_ws import BinanceWebSocketService
-from app.services.market_state import MarketStateStore
-from app.services.risk_service import RiskService
-from app.services.execution_service import ExecutionService
-from app.services.trading_cycle import TradingCycleService
-from app.services.trigger_executor import TriggerExecutor
+from app.state import (
+    ws_service,
+    trigger_executor,
+    trading_cycle_service,
+    risk_service,
+    execution_service,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,27 +33,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Service wiring ─────────────────────────────────────────────────────────────
-trigger_queue: asyncio.Queue = asyncio.Queue()
-
-market_store = MarketStateStore()
-risk_service = RiskService()
-execution_service = ExecutionService(risk_service=risk_service)
-trading_cycle_service = TradingCycleService(
-    market_store=market_store,
-    risk_service=risk_service,
-    execution_service=execution_service,
-)
-ws_service = BinanceWebSocketService(
-    symbols=settings.tracked_symbols,
-    market_store=market_store,
-    risk_service=risk_service,       # enables real-time exit checks
-    trigger_queue=trigger_queue,     # dispatches stop-loss / take-profit orders
-)
-trigger_executor = TriggerExecutor(
-    queue=trigger_queue,
-    execution_service=execution_service,
-)
 scheduler = AsyncIOScheduler(timezone="UTC")
 
 
@@ -77,13 +58,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     finally:
         db.close()
 
-    # Start WebSocket price stream
     asyncio.create_task(ws_service.run_forever())
-
-    # Start real-time exit order processor
     asyncio.create_task(trigger_executor.run_forever())
 
-    # Run immediately on startup, then every hour from that point
     scheduler.add_job(
         run_hourly_cycle,
         trigger=IntervalTrigger(hours=1),
@@ -111,3 +88,4 @@ app.include_router(health_router)
 app.include_router(assets_router)
 app.include_router(positions_router)
 app.include_router(decisions_router)
+app.include_router(market_router)
