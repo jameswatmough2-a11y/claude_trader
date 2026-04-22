@@ -1,20 +1,20 @@
 """
-sentiment.py — Aggregate sentiment scores and top headlines from
-CryptoPanic, Twitter/X v2, and Reddit (PRAW) for BTC, ETH, and SOL.
+sentiment.py — Aggregate sentiment scores and top headlines from free,
+no-auth sources:
 
-Each source contributes a score in [-1.0, +1.0] and up to 3 headlines.
-The final per-asset score is the mean across available sources.
+  1. RSS feeds    — CoinDesk, CoinTelegraph, Decrypt, Bitcoin Magazine
+  2. Reddit JSON  — r/cryptocurrency, r/bitcoin, r/ethtrader (public JSON API)
+  3. Fear & Greed — Alternative.me index (global crypto signal, 0–100)
+
+All sources are completely free and require no API keys.
 """
 
 import logging
-import os
 import time
 from dataclasses import dataclass, field
-from typing import Any
 
-import praw
+import feedparser
 import requests
-import tweepy
 from dotenv import load_dotenv
 from textblob import TextBlob
 
@@ -25,12 +25,20 @@ logger = logging.getLogger(__name__)
 # ── Asset keyword maps ────────────────────────────────────────────────────────
 
 ASSET_KEYWORDS: dict[str, list[str]] = {
-    "BTC/USDT": ["bitcoin", "BTC", "#bitcoin", "#BTC"],
-    "ETH/USDT": ["ethereum", "ETH", "#ethereum", "#ETH"],
-    "SOL/USDT": ["solana", "SOL", "#solana", "#SOL"],
+    "BTC/USDT": ["bitcoin", "btc"],
+    "ETH/USDT": ["ethereum", "eth"],
+    "SOL/USDT": ["solana", "sol"],
 }
 
+RSS_FEEDS = [
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://cointelegraph.com/rss",
+    "https://decrypt.co/feed",
+    "https://bitcoinmagazine.com/feed",
+]
+
 REDDIT_SUBS = ["cryptocurrency", "bitcoin", "ethtrader"]
+REDDIT_HEADERS = {"User-Agent": "crypto_sentiment_bot/1.0"}
 
 # ── Data structures ───────────────────────────────────────────────────────────
 
@@ -38,18 +46,18 @@ REDDIT_SUBS = ["cryptocurrency", "bitcoin", "ethtrader"]
 @dataclass
 class AssetSentiment:
     symbol: str
-    score: float  # [-1.0, +1.0]
+    score: float                          # blended [-1.0, +1.0]
     headline_count: int
     top_headlines: list[str] = field(default_factory=list)
     source_scores: dict[str, float] = field(default_factory=dict)
+    fear_greed_index: int | None = None   # 0–100 global signal
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
 def _polarity(text: str) -> float:
-    """TextBlob polarity: -1.0 (negative) to +1.0 (positive)."""
-    return TextBlob(text).sentiment.polarity  # type: ignore[return-value]
+    return float(TextBlob(text).sentiment.polarity)
 
 
 def _mean(values: list[float]) -> float:
@@ -60,200 +68,139 @@ def _clamp(value: float, lo: float = -1.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, value))
 
 
-# ── CryptoPanic ───────────────────────────────────────────────────────────────
+def _matches(text: str, keywords: list[str]) -> bool:
+    lower = text.lower()
+    return any(kw.lower() in lower for kw in keywords)
 
 
-def _cryptopanic_sentiment(keywords: list[str]) -> tuple[float, list[str]]:
-    """
-    Query CryptoPanic for news items matching *keywords*.
-    Returns (mean_score, top_3_headlines).
-    CryptoPanic votes.positive/negative give a simple ratio signal.
-    We blend that with TextBlob polarity on the headline text.
-    """
-    api_key = os.getenv("CRYPTOPANIC_API_KEY", "")
-    if not api_key:
-        logger.warning("CRYPTOPANIC_API_KEY not set — skipping CryptoPanic")
-        return 0.0, []
+# ── Source 1: RSS feeds ───────────────────────────────────────────────────────
 
-    # Use primary keyword (e.g. "bitcoin") for the filter
-    currencies = ",".join(k for k in keywords if not k.startswith("#"))[:50]
-    url = "https://cryptopanic.com/api/v1/posts/"
-    params = {
-        "auth_token": api_key,
-        "currencies": currencies,
-        "kind": "news",
-        "filter": "hot",
-        "public": "true",
-    }
 
-    try:
-        resp = requests.get(url, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:  # noqa: BLE001
-        logger.error("CryptoPanic request failed: %s", exc)
-        return 0.0, []
-
-    results = data.get("results", [])[:20]
+def _rss_sentiment(keywords: list[str]) -> tuple[float, list[str]]:
     scores: list[float] = []
     headlines: list[tuple[float, str]] = []
 
-    for item in results:
-        title: str = item.get("title", "")
-        if not title:
-            continue
-        votes = item.get("votes", {})
-        pos = votes.get("positive", 0)
-        neg = votes.get("negative", 0)
-        total = pos + neg
-        vote_score = (pos - neg) / total if total else 0.0
-        text_score = _polarity(title)
-        combined = _clamp((vote_score + text_score) / 2)
-        scores.append(combined)
-        headlines.append((combined, title))
+    for url in RSS_FEEDS:
+        try:
+            feed = feedparser.parse(url)
+            if feed.bozo and not feed.entries:
+                logger.warning("RSS: failed to parse %s", url)
+                continue
+            for entry in feed.entries[:40]:
+                title: str = entry.get("title", "")
+                summary: str = entry.get("summary", "")
+                combined = f"{title} {summary}"
+                if not _matches(combined, keywords):
+                    continue
+                score = _clamp(_polarity(combined))
+                scores.append(score)
+                headlines.append((abs(score), title))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("RSS: error fetching %s — %s", url, exc)
 
     if not scores:
         return 0.0, []
 
-    headlines.sort(key=lambda x: abs(x[0]), reverse=True)
+    headlines.sort(reverse=True)
     top_3 = [h for _, h in headlines[:3]]
     mean_score = _clamp(_mean(scores))
-    logger.info("CryptoPanic [%s]: score=%.3f from %d items", currencies, mean_score, len(scores))
+    logger.info("RSS [%s]: score=%.3f from %d entries", keywords[0], mean_score, len(scores))
     return mean_score, top_3
 
 
-# ── Twitter / X API v2 ───────────────────────────────────────────────────────
-
-
-def _twitter_sentiment(keywords: list[str]) -> tuple[float, list[str]]:
-    """
-    Search recent tweets for *keywords* and return mean TextBlob polarity.
-    Uses Tweepy's Client (v2 bearer-token auth).
-    """
-    token = os.getenv("TWITTER_BEARER_TOKEN", "")
-    if not token:
-        logger.warning("TWITTER_BEARER_TOKEN not set — skipping Twitter")
-        return 0.0, []
-
-    client = tweepy.Client(bearer_token=token, wait_on_rate_limit=True)
-    query = " OR ".join(keywords[:4]) + " lang:en -is:retweet"
-
-    try:
-        response = client.search_recent_tweets(
-            query=query,
-            max_results=100,
-            tweet_fields=["public_metrics", "created_at"],
-        )
-    except tweepy.TweepyException as exc:
-        logger.error("Twitter search failed: %s", exc)
-        return 0.0, []
-
-    tweets = response.data or []
-    if not tweets:
-        logger.info("Twitter [%s]: no tweets found", query[:60])
-        return 0.0, []
-
-    scores: list[float] = []
-    headlines: list[tuple[float, str]] = []
-
-    for tweet in tweets:
-        text: str = tweet.text
-        score = _clamp(_polarity(text))
-        scores.append(score)
-        if abs(score) > 0.1:
-            headlines.append((score, text[:140]))
-
-    headlines.sort(key=lambda x: abs(x[0]), reverse=True)
-    top_3 = [h for _, h in headlines[:3]]
-    mean_score = _clamp(_mean(scores))
-    logger.info("Twitter [%s]: score=%.3f from %d tweets", keywords[0], mean_score, len(scores))
-    return mean_score, top_3
-
-
-# ── Reddit PRAW ──────────────────────────────────────────────────────────────
+# ── Source 2: Reddit public JSON (no auth) ────────────────────────────────────
 
 
 def _reddit_sentiment(keywords: list[str]) -> tuple[float, list[str]]:
-    """
-    Search r/cryptocurrency, r/bitcoin, r/ethtrader for *keywords*.
-    Score = TextBlob polarity weighted by post score (upvotes).
-    """
-    client_id = os.getenv("REDDIT_CLIENT_ID", "")
-    client_secret = os.getenv("REDDIT_CLIENT_SECRET", "")
-    user_agent = os.getenv("REDDIT_USER_AGENT", "crypto_bot/1.0")
-
-    if not client_id or not client_secret:
-        logger.warning("REDDIT credentials not set — skipping Reddit")
-        return 0.0, []
-
-    reddit = praw.Reddit(
-        client_id=client_id,
-        client_secret=client_secret,
-        user_agent=user_agent,
-    )
-
-    primary_kw = keywords[0].lower()
-    weighted_scores: list[tuple[float, float]] = []  # (score, weight)
+    primary_kw = keywords[0]
+    weighted_scores: list[tuple[float, float]] = []
     headlines: list[tuple[float, str]] = []
 
-    for sub_name in REDDIT_SUBS:
+    for sub in REDDIT_SUBS:
+        url = f"https://www.reddit.com/r/{sub}/search.json"
+        params = {
+            "q": primary_kw,
+            "sort": "hot",
+            "t": "day",
+            "limit": 25,
+            "restrict_sr": "true",
+        }
         try:
-            subreddit = reddit.subreddit(sub_name)
-            posts = list(subreddit.search(primary_kw, sort="hot", time_filter="day", limit=30))
+            resp = requests.get(url, params=params, headers=REDDIT_HEADERS, timeout=10)
+            resp.raise_for_status()
+            posts = resp.json().get("data", {}).get("children", [])
         except Exception as exc:  # noqa: BLE001
-            logger.error("Reddit search failed on r/%s: %s", sub_name, exc)
+            logger.warning("Reddit JSON: error on r/%s — %s", sub, exc)
+            time.sleep(1)
             continue
 
         for post in posts:
-            title: str = post.title
-            post_score = max(post.score, 1)  # avoid zero weight
-            polarity = _clamp(_polarity(title))
-            weighted_scores.append((polarity, post_score))
-            headlines.append((abs(polarity), title))
+            data = post.get("data", {})
+            title: str = data.get("title", "")
+            upvotes: float = max(float(data.get("score", 1)), 1.0)
+            score = _clamp(_polarity(title))
+            weighted_scores.append((score, upvotes))
+            headlines.append((abs(score), title))
 
-        # PRAW is synchronous; small sleep to be polite
-        time.sleep(0.5)
+        time.sleep(1)
 
     if not weighted_scores:
         return 0.0, []
 
     total_weight = sum(w for _, w in weighted_scores)
     mean_score = _clamp(sum(s * w for s, w in weighted_scores) / total_weight)
-
     headlines.sort(reverse=True)
     top_3 = [h for _, h in headlines[:3]]
-    logger.info("Reddit [%s]: score=%.3f from %d posts", primary_kw, mean_score, len(weighted_scores))
+    logger.info(
+        "Reddit [%s]: score=%.3f from %d posts", primary_kw, mean_score, len(weighted_scores)
+    )
     return mean_score, top_3
+
+
+# ── Source 3: Fear & Greed Index (free, no auth) ──────────────────────────────
+
+
+def _fear_greed_index() -> int | None:
+    try:
+        resp = requests.get("https://api.alternative.me/fng/?limit=1", timeout=8)
+        resp.raise_for_status()
+        data = resp.json()["data"][0]
+        value = int(data["value"])
+        logger.info("Fear & Greed Index: %d (%s)", value, data["value_classification"])
+        return value
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Fear & Greed Index fetch failed: %s", exc)
+        return None
+
+
+def _fear_greed_to_score(value: int) -> float:
+    """Map 0–100 to [-1.0, +1.0]: 0 → -1.0 (fear), 50 → 0.0, 100 → +1.0 (greed)."""
+    return _clamp((value - 50) / 50.0)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
 
-def get_asset_sentiment(symbol: str) -> AssetSentiment:
-    """
-    Aggregate sentiment for one asset (e.g. "BTC/USDT") across all sources.
-    Returns an AssetSentiment with a blended score and top headlines.
-    """
-    keywords = ASSET_KEYWORDS.get(symbol, [symbol.split("/")[0]])
+def get_asset_sentiment(symbol: str, fear_greed: int | None = None) -> AssetSentiment:
+    keywords = ASSET_KEYWORDS.get(symbol, [symbol.split("/")[0].lower()])
     logger.info("sentiment: gathering for %s (keywords: %s)", symbol, keywords)
 
     source_scores: dict[str, float] = {}
     all_headlines: list[str] = []
 
-    cp_score, cp_headlines = _cryptopanic_sentiment(keywords)
-    source_scores["cryptopanic"] = cp_score
-    all_headlines.extend(cp_headlines)
-
-    tw_score, tw_headlines = _twitter_sentiment(keywords)
-    source_scores["twitter"] = tw_score
-    all_headlines.extend(tw_headlines)
+    rss_score, rss_headlines = _rss_sentiment(keywords)
+    source_scores["rss"] = rss_score
+    all_headlines.extend(rss_headlines)
 
     rd_score, rd_headlines = _reddit_sentiment(keywords)
     source_scores["reddit"] = rd_score
     all_headlines.extend(rd_headlines)
 
+    if fear_greed is not None:
+        source_scores["fear_greed"] = _fear_greed_to_score(fear_greed)
+
     blended = _clamp(_mean(list(source_scores.values())))
-    # De-duplicate and keep top 3 unique headlines
+
     seen: set[str] = set()
     unique_headlines: list[str] = []
     for h in all_headlines:
@@ -277,9 +224,11 @@ def get_asset_sentiment(symbol: str) -> AssetSentiment:
         headline_count=len(all_headlines),
         top_headlines=unique_headlines,
         source_scores=source_scores,
+        fear_greed_index=fear_greed,
     )
 
 
 def get_all_sentiment(symbols: list[str]) -> dict[str, AssetSentiment]:
-    """Return sentiment for every symbol in *symbols*."""
-    return {sym: get_asset_sentiment(sym) for sym in symbols}
+    """Fetch Fear & Greed once, then gather per-asset sentiment."""
+    fear_greed = _fear_greed_index()
+    return {sym: get_asset_sentiment(sym, fear_greed) for sym in symbols}

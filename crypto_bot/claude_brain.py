@@ -89,8 +89,10 @@ def _build_prompt(market_data: dict[str, Any], sentiment_data: dict[str, Any]) -
         # Sentiment section
         sent = sentiment_data.get(symbol)
         if sent:
+            fg = sent.fear_greed_index
+            fg_str = f"  Fear & Greed Index: {fg}/100" if fg is not None else ""
             lines.append(
-                f"Sentiment score: {sent.score:.3f} (range −1.0 to +1.0)  "
+                f"Sentiment score: {sent.score:.3f} (range −1.0 to +1.0){fg_str}  "
                 f"Sources: {json.dumps({k: round(v, 3) for k, v in sent.source_scores.items()})}"
             )
             if sent.top_headlines:
