@@ -1,262 +1,301 @@
 # Runtime Workflow
 
-This document describes exactly what happens at each stage of the bot's life, from process start to individual trade execution.
+This document describes exactly what happens at each stage of the bot's lifetime, from process start to individual trade execution.
 
 ---
 
-## 1. Startup Sequence
+## 1. Startup
 
-When you run `uvicorn app.main:app`, the following happens in order:
+### 1.1 Module-level initialization (`main.py`)
 
-### 1.1 Module-level instantiation (before lifespan)
-
-`main.py` runs its top-level code immediately when the module is imported:
+Before `lifespan` runs, Python imports `main.py` and executes the module body. This creates all service singletons:
 
 ```python
-trigger_queue  = asyncio.Queue()
-market_store   = MarketStateStore()
-risk_service   = RiskService()
-execution_service    = ExecutionService(risk_service=risk_service)
-trading_cycle_service = TradingCycleService(...)
-ws_service     = BinanceWebSocketService(..., risk_service=risk_service, trigger_queue=trigger_queue)
-trigger_executor = TriggerExecutor(queue=trigger_queue, execution_service=execution_service)
-scheduler      = AsyncIOScheduler(timezone="UTC")
+trigger_queue     = asyncio.Queue()        # shared between WS and TriggerExecutor
+market_store      = MarketStateStore()     # empty dict
+risk_service      = RiskService()          # empty _positions dict
+execution_service = ExecutionService(risk_service)
+trading_cycle     = TradingCycleService(market_store, risk_service, execution_service)
+ws_service        = BinanceWebSocketService(symbols, market_store, risk_service, trigger_queue)
+trigger_executor  = TriggerExecutor(trigger_queue, execution_service)
+scheduler         = AsyncIOScheduler(timezone="UTC")
 ```
 
-At this point no I/O has happened. All objects exist in memory.
+At this point no I/O has occurred and no async loop is running.
 
-### 1.2 FastAPI lifespan starts
+### 1.2 FastAPI lifespan: `startup`
 
-The `lifespan` async context manager runs:
+Uvicorn starts the asyncio event loop and calls the `lifespan` context manager's `__aenter__`:
 
-**Step 1 — Database initialisation**
+**Step 1 — Database initialization**
 ```python
 init_db()
 ```
-`init_db()` calls `Base.metadata.create_all(bind=engine)`. SQLAlchemy inspects all registered ORM models and creates their tables if they don't already exist. If the database file doesn't exist, SQLite creates it. This is idempotent — safe to run on every restart.
+Calls `Base.metadata.create_all(bind=engine)`. Creates all five SQLite tables if they do not exist. Existing data is preserved (not dropped). This is a synchronous call.
 
 **Step 2 — WebSocket task**
 ```python
 asyncio.create_task(ws_service.run_forever())
 ```
-Spawns a background async task. The WebSocket does not block startup — it begins connecting concurrently while the rest of startup continues.
+Schedules the WebSocket loop as a background asyncio task. It begins connecting to Binance immediately (before the hourly cycle fires).
 
 **Step 3 — Trigger executor task**
 ```python
 asyncio.create_task(trigger_executor.run_forever())
 ```
-Spawns another background async task. This immediately begins `await self.queue.get()` — it blocks asynchronously, waiting for the first exit order to appear.
+Schedules the queue drain loop as a background asyncio task. It immediately awaits `queue.get()` — suspended until the first exit order arrives.
 
-**Step 4 — Scheduler**
+**Step 4 — Hourly cycle scheduler**
 ```python
 scheduler.add_job(
     run_hourly_cycle,
     trigger=IntervalTrigger(hours=1),
-    next_run_time=datetime.now(timezone.utc),
+    next_run_time=datetime.now(timezone.utc),   # fire immediately
 )
 scheduler.start()
 ```
-`next_run_time=now` means the first cycle is scheduled to run in the next event loop iteration. Practically it fires within a second or two of startup completing.
+The `next_run_time=now` means the **first cycle fires at startup**, not one hour later. Subsequent cycles run every 60 minutes from that point.
 
-**Step 5 — Startup complete**
-
-FastAPI logs `Application startup complete`. The server is now accepting HTTP requests.
+**Step 5 — Yield**
+FastAPI yields control back to Uvicorn. The server is now accepting HTTP requests and the three background tasks are running.
 
 ---
 
-## 2. WebSocket Loop (Continuous)
+## 2. Continuous Operation: WebSocket Loop
 
-The WebSocket loop runs for the entire lifetime of the process. Here is what happens on each price tick:
+This runs forever in the background (task 1).
 
-### 2.1 Receiving a message
+### 2.1 Connection
 
-Binance sends a JSON payload for each symbol roughly every second. The combined stream format wraps the data:
+```python
+async with connect(url, ping_interval=20, ping_timeout=60) as ws:
+    async for message in ws:
+        self._handle_message(message)
+```
+
+`ping_interval=20` sends WebSocket pings every 20 seconds. `ping_timeout=60` disconnects if no pong is received within 60 seconds. On any exception (network error, timeout, disconnect), the outer `while True` catches it, logs it, sleeps 5 seconds, and reconnects.
+
+### 2.2 Per-tick message handling (`_handle_message`)
+
+Every Binance `@ticker` message delivers a full 24h statistics snapshot for one symbol. The combined-stream envelope looks like:
 
 ```json
 {
   "stream": "btcusdt@ticker",
   "data": {
     "s": "BTCUSDT",
-    "c": "93142.50",    ← last price
-    "b": "93140.00",    ← best bid
-    "a": "93145.00",    ← best ask
-    "h": "94200.00",    ← 24h high
-    "l": "92100.00",    ← 24h low
-    "q": "1482934200",  ← 24h quote volume
-    "P": "-0.42"        ← 24h price change %
+    "c": "67423.0100",
+    "b": "67422.9900",
+    "a": "67423.0100",
+    "q": "1234567890.00",
+    "P": "-0.842",
+    "h": "68500.0000",
+    "l": "66200.0000"
   }
 }
 ```
 
-### 2.2 Updating MarketStateStore
+Processing steps:
+1. `json.loads(message)` → parse envelope
+2. `payload.get("data", payload)` → extract the `data` sub-object (handles both combined-stream and direct-stream formats)
+3. Extract symbol from `data["s"]`
+4. Parse all numeric fields as `Decimal`
+5. Call `market_store.update(symbol, last_price=..., bid=..., ...)`
+6. If `last_price` is available and `risk_service` is wired: call `risk_service.check_exit_conditions(symbol, float(last_price))`
+7. If exit is triggered: `trigger_queue.put_nowait(order)`
 
-`BinanceWebSocketService._handle_message()` extracts the `data` field and calls:
+`put_nowait()` is used (non-blocking) because `_handle_message` is a synchronous method called within the async loop. The queue is unbounded, so `put_nowait` never raises `QueueFull`.
 
-```python
-self.market_store.update(
-    symbol=symbol,
-    last_price=Decimal(data["c"]),
-    bid=Decimal(data["b"]),
-    ...
-)
-```
+### 2.3 Exit condition check
 
-`MarketStateStore.update()` upserts a `SymbolMarketState` entry. If the symbol already exists, it updates only the fields provided and refreshes `updated_at`. This is a simple dict write — no I/O.
-
-### 2.3 Real-time exit check
-
-After updating the store, the WebSocket handler checks for exit conditions:
+`risk_service.check_exit_conditions(symbol, price)` is called on **every tick** for every tracked symbol. This is inexpensive — it's a dict lookup plus two float comparisons:
 
 ```python
-order = self._risk_service.check_exit_conditions(symbol, float(data["c"]))
-if order:
-    self._trigger_queue.put_nowait(order)
+pos = self._positions.get(symbol.upper())
+if pos is None:
+    return None  # fast path: no position open
+
+drawdown_pct = (pos.entry_price - price) / pos.entry_price * 100
+gain_pct     = (price - pos.entry_price) / pos.entry_price * 100
+
+if drawdown_pct >= settings.stop_loss_pct:
+    # stop-loss triggered
+elif settings.take_profit_pct > 0 and gain_pct >= settings.take_profit_pct:
+    # take-profit triggered
 ```
 
-`check_exit_conditions()` looks up whether there is an open position for this symbol, computes the drawdown or gain since entry, and compares against `STOP_LOSS_PCT` and `TAKE_PROFIT_PCT`. If either threshold is breached:
+If triggered:
+1. The position is **deleted immediately** from `_positions` (prevents re-triggering on next tick)
+2. A SELL order dict is returned and placed on `trigger_queue`
 
-1. The position is **immediately removed** from `_positions` — this prevents the same position from triggering again on the very next tick before the order has been filled.
-2. A SELL order dict is returned containing `trigger_price`.
-3. `put_nowait()` places it on the queue without blocking.
+### 2.4 Trigger executor processes the exit
 
-If no threshold is breached, `check_exit_conditions()` returns `None` and nothing else happens.
+The `TriggerExecutor` wakes on `await self.queue.get()`, then:
+1. Dispatches `self._execute(order)` to a thread pool (`loop.run_in_executor`)
+2. Calls `execution_service.execute_decision(order, market_data, balance)`
+3. `market_data` is constructed as `{asset: {"last_price": trigger_price}}`
+4. `balance` is fetched fresh for each execution (paper stub or ccxt)
+5. The result is logged at `WARNING` level
 
-### 2.4 Error handling and reconnection
-
-If the WebSocket connection drops or throws any exception, `run_forever()` catches it, logs the error, and reconnects after a 5-second delay:
-
-```python
-except Exception as exc:
-    logger.exception("Binance WebSocket error — reconnecting in 5s: %s", exc)
-    await asyncio.sleep(5)
-```
-
-`asyncio.CancelledError` is re-raised so the task can be cleanly shut down by the lifespan exit.
+This means exit executions happen **out-of-band** from the hourly cycle. They can fire at any price tick, independent of the cycle schedule.
 
 ---
 
-## 3. Real-Time Exit Execution
+## 3. Hourly Trading Cycle
 
-When an order lands on the queue, `TriggerExecutor.run_forever()` picks it up:
+This runs once per hour (and once immediately at startup) in a thread pool worker managed by APScheduler. The entry point is `run_hourly_cycle()` in `main.py`:
 
 ```python
-order = await self.queue.get()
-await loop.run_in_executor(None, self._execute, order)
-self.queue.task_done()
+def run_hourly_cycle() -> None:
+    db = SessionLocal()
+    try:
+        trading_cycle_service.run(db)
+    except Exception:
+        logger.exception("Unhandled error in hourly trading cycle")
+    finally:
+        db.close()
 ```
 
-`run_in_executor(None, ...)` runs `_execute` in the default thread pool. This is critical — `_execute` may call ccxt (HTTP) and write to files, both of which are blocking operations that would stall the async event loop if called directly.
+A fresh `SessionLocal` is opened for each cycle and closed in the `finally` block.
 
-Inside `_execute`:
+### Step 1 — Build market data
 
-1. Fetch the current balance (`fetch_balance()` — uses paper constant if no API key).
-2. Build a minimal `market_data` dict: `{asset: {"last_price": trigger_price}}`.
-3. Call `self.execution_service.execute_decision(order, market_data, balance)`.
-4. The execution service handles paper/live logic, position state update, and file logging.
+`TradingCycleService._build_market_data()` converts the current `MarketStateStore` state into a flat dict:
 
-The trigger executor does **not** write to the database. The next hourly cycle will capture the updated position state (flat) when it persists its snapshot.
+```python
+{
+  "BTCUSDT": {
+    "symbol": "BTCUSDT",
+    "last_price": 67423.01,
+    "bid": 67422.99,
+    "ask": 67423.01,
+    "volume_24h": 1234567890.0,
+    "price_change_24h_pct": -0.842,
+    "high_24h": 68500.0,
+    "low_24h": 66200.0,
+    "quote_volume_24h": 1234567890.0,
+    "ohlcv": {
+      "last_close": 67423.01,
+      "high_24h": 68500.0,
+      "low_24h": 66200.0,
+      "avg_volume_24h": 1234567890.0,
+      "price_change_pct_24h": -0.842
+    },
+    "orderbook": {}
+  },
+  ...
+}
+```
+
+If `market_store.all()` is empty (WebSocket hasn't connected yet), the method returns `{}` and the cycle logs a warning and returns early — no AI call, no persistence.
+
+### Step 2 — Fetch sentiment
+
+`get_all_sentiment(symbols)` is called. This:
+1. Fetches the Fear & Greed Index once (shared across all symbols)
+2. For each symbol, calls `get_asset_sentiment(symbol, fear_greed)`
+3. Each `get_asset_sentiment` fetches RSS and Reddit, scores with TextBlob, and blends the three source scores
+
+This call is wrapped in a try/except — if sentiment fails, the cycle proceeds with `sentiment_data = {}` (Claude sees "Sentiment: unavailable").
+
+### Step 3 — Fetch AI decisions
+
+`get_trading_decisions(market_data, sentiment_data)` calls Claude:
+
+1. `_build_prompt()` constructs the user message (see [trading_logic.md](trading_logic.md))
+2. `client.messages.create(model=..., max_tokens=2048, system=SYSTEM_PROMPT, messages=[...])` is called synchronously
+3. Response text is extracted, JSON stripped of markdown, parsed
+4. `_validate_decisions()` validates, enforces confidence threshold, fills in HOLDs for missing symbols
+
+If the API call fails, the cycle defaults all symbols to `HOLD` with `confidence=0.0` and a "AI service unavailable" reasoning.
+
+### Step 4 — Filter through risk
+
+`risk_service.filter_decisions(decisions, market_data)` runs two checks:
+
+1. `check_stop_losses(market_data)` — for any open positions, checks if the current price breaches stop-loss or take-profit thresholds. Returns a list of SELL orders. Assets with stop-loss triggers skip step 2 and go straight to execution.
+
+2. For each remaining decision, `evaluate_decision(decision, current_price)` checks:
+   - Kill switch (if active → HOLD)
+   - BUY while already holding → HOLD
+   - SELL with no open position → HOLD
+   - Confidence below threshold → HOLD
+   - Size cap enforcement (cap at `MAX_POSITION_PCT`)
+   - Total exposure cap (reduce size to available headroom or → HOLD if none)
+
+The method returns a new list of decisions with actions and sizes adjusted by the risk rules.
+
+### Step 5 — Fetch balance
+
+`fetch_balance()` returns either the paper balance stub (`{"USDT": {"free": 10000, "used": 0, "total": 10000}}`) or the live ccxt balance. Used to compute trade quantities.
+
+### Step 6 — Execute each decision
+
+For each decision in the filtered list, `execution_service.execute_decision(decision, {symbol: md}, balance)` is called. This happens inside `_persist_cycle()`, not before it, so the execution result is available for persistence.
+
+**HOLD**: The record is logged to `trades.jsonl` with `order=None`.
+
+**BUY/SELL (paper)**: Computes `qty = portfolio * size_pct% / price`, builds synthetic order, updates position tracking in `RiskService`.
+
+**BUY/SELL (live)**: Places market order via ccxt, uses fill price from `order["average"]`.
+
+### Step 7 — Persist to database
+
+For each decision, `_persist_cycle()` writes four records in sequence:
+
+```
+HourlyMarketSnapshot  →  flush (get snapshot.id)
+Position              →  flush (get position.id)
+[execute decision]    →  get exec_result
+AIDecision            →  flush (get ai_rec.id)
+Execution             →  commit
+```
+
+`db.flush()` is used after each insert to obtain the auto-generated primary key before the next insert needs it as a foreign key. The final `db.commit()` writes all four records atomically.
+
+If a snapshot for the same `(asset_id, snapshot_time)` already exists (e.g. APScheduler fired twice), `IntegrityError` is caught, the session is rolled back, and the cycle continues with the next symbol.
 
 ---
 
-## 4. Hourly Trading Cycle
+## 4. Shutdown
 
-The cycle runs in the APScheduler thread (sync context). Each run goes through six phases:
-
-### Phase 1 — Build market data
+When Uvicorn receives `SIGTERM` (or the process is killed), the `lifespan` context manager's `__aexit__` runs:
 
 ```python
-market_data = self._build_market_data()
+scheduler.shutdown(wait=False)
+logger.info("Bot stopped")
 ```
 
-Iterates `MarketStateStore.all()` and converts each `SymbolMarketState` into a dict. Only symbols with a non-None `last_price` are included — if the WebSocket hasn't received a tick for a symbol yet, it's skipped. No HTTP calls are made here.
-
-If `market_data` is empty (WebSocket not yet connected), the cycle logs a warning and returns early.
-
-### Phase 2 — Sentiment
-
-```python
-sentiment_data = self._fetch_sentiment(symbols)
-```
-
-Calls `get_all_sentiment(symbols)` which fetches the Fear & Greed index once, then for each symbol fetches and scores RSS headlines and Reddit posts. This typically takes 20–60 seconds depending on network conditions.
-
-Internally, each RSS feed is parsed with `feedparser`. Each entry's title and summary are combined and run through `TextBlob(text).sentiment.polarity`, which returns a float in `[-1, 1]`. Entries are matched to a symbol using keyword lists (e.g. `["bitcoin", "btc"]` for BTCUSDT). Matched scores are averaged per source. The Fear & Greed value (0–100) is normalised to `[-1, 1]` as `(value - 50) / 50`. All source scores are averaged into a final blended score.
-
-If any source fails (network error, API down), it's skipped and the others continue. If all sources fail, the sentiment dict is empty and Claude is told "sentiment unavailable".
-
-### Phase 3 — AI decisions
-
-```python
-decisions = get_trading_decisions(market_data, sentiment_data)
-```
-
-`_build_prompt()` formats the market and sentiment data into a plain-text prompt, one section per symbol. The prompt is sent to Claude with `SYSTEM_PROMPT` which instructs it to return only a JSON array.
-
-Claude's response is parsed with `_extract_json()` which strips any markdown fences and uses a regex to locate the `[...]` array. The raw JSON is passed to `_validate_decisions()` which:
-
-- Skips items missing required keys
-- Uppercases asset and action
-- Clamps confidence to `[0, 1]` and `size_pct` to `[0, 20]`
-- Forces HOLD if `confidence < 0.7` (regardless of what Claude said)
-- Adds a default HOLD for any tracked symbol absent from Claude's response
-
-If the Claude API call fails entirely, all symbols default to HOLD with a note in the reasoning field.
-
-### Phase 4 — Risk filtering
-
-```python
-filtered = self.risk_service.filter_decisions(decisions, market_data)
-```
-
-First runs `check_stop_losses(market_data)` — a batch version of the real-time exit check, in case a stop-loss was triggered between WebSocket ticks and wasn't caught by the real-time path. Stop-loss decisions take priority over whatever Claude returned.
-
-Then for each non-stop-loss decision, calls `evaluate_decision()`:
-
-| Check | Result |
-|---|---|
-| Kill switch active | HOLD |
-| action == HOLD | pass through as HOLD |
-| BUY and already holding | HOLD (entry guard) |
-| SELL and not holding | HOLD (exit guard) |
-| confidence < MIN_CONFIDENCE | HOLD |
-| size_pct > MAX_POSITION_PCT | cap size_pct |
-| BUY and total exposure at cap | HOLD |
-| otherwise | approve with adjusted size |
-
-### Phase 5 — Execution
-
-```python
-exec_result = self.execution_service.execute_decision(decision, {symbol: md}, balance)
-```
-
-Called per decision inside `_persist_cycle`. The execution service:
-
-1. Computes order quantity: `portfolio_usdt * (size_pct / 100) / current_price`
-2. In paper mode: constructs a synthetic order, calls `risk_service.record_open_position()` or `close_position()`, appends to `logs/trades.jsonl`
-3. In live mode: calls `ccxt.binance.create_market_order()`, uses the filled price for position tracking
-
-HOLD decisions skip quantity computation and only log the decision.
-
-### Phase 6 — Persistence
-
-For each symbol, the cycle writes four rows to SQLite:
-
-1. **`HourlyMarketSnapshot`** — price, volume, high/low at the time of the cycle
-2. **`Position`** — current wallet balance snapshot (the position side is always "flat" at snapshot time since actual open positions are tracked in memory)
-3. **`AIDecision`** — the approved decision: action, confidence, reasoning, model name
-4. **`Execution`** — the order result: action taken, quantity, price, status
-
-Each symbol is committed independently. If one symbol fails (duplicate snapshot due to a re-run, DB error, etc.), the session is rolled back for that symbol only and the others continue.
+`wait=False` means APScheduler stops immediately without waiting for a running job to finish. The two asyncio tasks (`ws_service.run_forever`, `trigger_executor.run_forever`) are cancelled by the event loop shutdown. Positions in `RiskService._positions` are lost.
 
 ---
 
-## 5. Shutdown
+## Timeline: First 5 Minutes
 
-When the process receives SIGTERM or CTRL+C:
+```
+t=0s    Process starts
+        Module-level singletons created
+        Lifespan enters
 
-1. FastAPI triggers the lifespan exit (the `yield` returns).
-2. `scheduler.shutdown(wait=False)` stops the scheduler immediately without waiting for a running job.
-3. The WebSocket task and trigger executor task are cancelled by the asyncio event loop.
-4. Uvicorn exits.
+t=0s    init_db() runs — tables created/verified
+t=0s    WebSocket task created — begins connecting to Binance
+t=0s    TriggerExecutor task created — awaiting queue items
+t=0s    APScheduler starts — first cycle job queued with next_run_time=now
 
-Any in-flight cycle or trigger execution that was running in a thread pool will complete naturally — thread pool tasks are not forcibly killed.
+t~1s    Binance WebSocket connected
+        First @ticker messages arrive, MarketStateStore populated
+
+t~1s    First hourly cycle fires (APScheduler job runs)
+        Sentiment fetch begins (may take 10-30s for RSS + Reddit)
+        Claude API called
+        Risk filter applied
+        Decisions executed (paper)
+        DB records written
+
+t~30s   First cycle complete
+
+t=1h    Second cycle fires
+        ...
+```
+
+If the WebSocket hasn't connected before the first cycle fires (very unlikely on a fast network), `_build_market_data()` returns empty and the cycle skips with a warning. The next hourly cycle will succeed once the WebSocket is connected.

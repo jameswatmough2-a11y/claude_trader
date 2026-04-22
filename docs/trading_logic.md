@@ -1,233 +1,297 @@
 # Trading Logic
 
-This document explains the decision-making chain in full detail — how the bot goes from raw market data to an executed trade.
+This document explains the decision-making chain in full detail — how the bot goes from raw market data to an executed trade, and what rules govern every step.
 
 ---
 
-## 1. AI Decision Engine
+## Overview
 
-### Role
-
-Claude is asked once per hour to produce a trading decision for each tracked symbol. It receives structured market and sentiment data and returns a JSON array.
-
-### System prompt
+The trading logic pipeline has four stages:
 
 ```
-You are a disciplined crypto trading analyst. Evaluate the market and
-sentiment data provided, then return a single JSON array of trading decisions —
-one object per asset. Never deviate from the schema below.
-
-Decision schema:
-{
-  "asset":      "<SYMBOL>",
-  "action":     "BUY" | "SELL" | "HOLD",
-  "confidence": <float 0.0–1.0>,
-  "size_pct":   <int 0–20>,
-  "reasoning":  "<one-sentence rationale>"
-}
-
-Rules:
-- Return ONLY a valid JSON array. No markdown, no extra text.
-- size_pct must be 0 when action is HOLD.
-- size_pct maximum is 20 for any single asset.
-- If confidence < 0.7, set action to HOLD and size_pct to 0.
-- Base decisions solely on the data provided.
+1. Data assembly (market + sentiment)
+       ↓
+2. AI decision (Claude API)
+       ↓
+3. Risk filtering (RiskService)
+       ↓
+4. Execution (paper or live)
 ```
 
-The prompt is structured as constraints, not suggestions. Claude is not asked for analysis — it is asked to populate a schema. This keeps outputs consistent and parseable.
+Each stage is fault-isolated — a failure in any stage produces a safe default (HOLD) rather than propagating an error to the next stage.
 
-### Confidence score
+---
 
-Confidence is a number Claude assigns to its own certainty. It is used in two places:
+## Stage 1: Data Assembly
 
-1. **Claude's self-filtering**: the system prompt instructs Claude to set action=HOLD when confidence < 0.7
-2. **Bot's validation layer**: `_validate_decisions()` also enforces this, overriding Claude if it didn't
+### Market data
 
-In practice, Claude's self-filtered decisions and the bot's override produce the same result — but the bot's layer is a safety net for cases where Claude ignores the instruction.
+The trading cycle reads from `MarketStateStore`, which is continuously updated by the WebSocket. For each symbol, the following values are available:
 
-### size_pct
+- `last_price` — most recent trade price
+- `bid` / `ask` — best bid and ask
+- `volume_24h` — 24-hour quote asset volume in USDT
+- `price_change_24h_pct` — percentage change over last 24 hours
+- `high_24h` / `low_24h` — 24-hour high and low
 
-Claude recommends a position size as a percentage of the total portfolio. The maximum is 20% per position. The bot further caps this against `MAX_POSITION_PCT` and `MAX_TOTAL_EXPOSURE_PCT` in the risk layer.
+The cycle constructs a `market_data` dict and also builds an `ohlcv` sub-dict by repurposing these fields (`last_price` as all OHLC values, `high_24h`/`low_24h` for range, `volume_24h` for average volume). There is no separate OHLCV fetch during the cycle — the WebSocket stats are used directly.
 
-### Fallback behaviour
+### Sentiment data
 
-| Failure | What happens |
+`get_all_sentiment(symbols)` is called once per cycle. It:
+1. Fetches the Fear & Greed Index (global, shared across symbols)
+2. For each symbol: fetches and scores RSS headlines + Reddit posts
+3. Returns `dict[str, AssetSentiment]`
+
+The entire sentiment block is wrapped in a try/except. If it fails, the cycle uses `sentiment_data = {}` and Claude sees "Sentiment: unavailable" for all symbols.
+
+---
+
+## Stage 2: AI Decision (Claude)
+
+### Prompt structure
+
+The user prompt has this exact structure:
+
+```
+=== HOURLY TRADING ANALYSIS — 2026-04-22 14:00 UTC ===
+
+Analyse the following data and return one JSON decision per asset.
+
+--- BTCUSDT ---
+Price: $67,423.0100  Bid: $67,422.9900  Ask: $67,423.0100
+24h High: $68,500.0000  24h Low: $66,200.0000  Change: -0.842%
+Avg 24h Volume: 1,234,568  Quote Volume: $1,234,567,890
+Sentiment: 0.123 | Fear & Greed: 62/100
+  1. Bitcoin ETF inflows reach record high this week
+  2. BTC holds above key support at $67k
+  3. Institutional interest in crypto remains elevated
+
+--- ETHUSDT ---
+Price: $3,245.1200  Bid: $3,245.0800  Ask: $3,245.1400
+24h High: $3,310.0000  24h Low: $3,190.0000  Change: -1.234%
+Avg 24h Volume: 456,789  Quote Volume: $456,789,012
+Sentiment: -0.045 | Fear & Greed: 62/100
+  1. Ethereum network activity increases ahead of upgrade
+  2. ETH staking rewards remain stable
+
+Return ONLY a JSON array.
+```
+
+### Expected response schema
+
+Claude is expected to return exactly:
+
+```json
+[
+  {
+    "asset": "BTCUSDT",
+    "action": "BUY",
+    "confidence": 0.82,
+    "size_pct": 15,
+    "reasoning": "Strong 24h volume and positive sentiment support bullish entry."
+  },
+  {
+    "asset": "ETHUSDT",
+    "action": "HOLD",
+    "confidence": 0.55,
+    "size_pct": 0,
+    "reasoning": "Mixed signals; confidence below threshold, maintaining HOLD."
+  }
+]
+```
+
+### System prompt constraints
+
+The system prompt encodes the following rules that Claude is expected to follow:
+- Return only a valid JSON array — no explanation, no markdown
+- `size_pct` must be 0 when `action` is HOLD
+- `size_pct` maximum is 20 for any single asset
+- If `confidence < 0.7`, set action to HOLD and size_pct to 0
+- Base decisions solely on the data provided (no outside knowledge about future events)
+
+### Confidence handling
+
+Confidence reflects how certain Claude is in its recommendation. The system is designed with a hard floor:
+
+| Confidence | Effect |
 |---|---|
-| API key missing | `ValueError` raised → caught by `_fetch_decisions()` → all HOLD |
-| Network error | Exception caught → all HOLD with "AI service unavailable" |
-| Response is not JSON | `json.loads` fails → caught → all HOLD |
-| Response is not an array | `ValueError` raised → caught → all HOLD |
-| Symbol missing from response | Added as HOLD with "Missing from model response" |
-| Invalid action value | Coerced to HOLD |
-| Malformed confidence | Clamped to `[0, 1]` |
+| `>= 0.7` (default `MIN_CONFIDENCE`) | Decision passes through to risk check |
+| `< 0.7` | Action forced to HOLD in `_validate_decisions` |
+| `< 0.7` | Action forced to HOLD again in `risk_service.evaluate_decision` (second layer) |
+
+The double enforcement (AI validator + risk service) is intentional redundancy. Even if the JSON parsing yields an unexpected confidence value, the risk layer catches it.
+
+### Fallback behavior
+
+If the Claude API call fails for any reason (network error, rate limit, invalid response, JSON parse error):
+- All symbols default to `{"action": "HOLD", "confidence": 0.0, "size_pct": 0, "reasoning": "AI service unavailable — defaulted to HOLD."}`
+- The cycle continues to the risk filter and persistence stages
+- The error is logged at `EXCEPTION` level
+
+If Claude returns a valid JSON array but omits one or more tracked symbols, the validator inserts a HOLD default for each missing symbol:
+- `{"action": "HOLD", "confidence": 0.0, "reasoning": "Missing from model response — defaulted to HOLD."}`
 
 ---
 
-## 2. Sentiment Analysis
+## Stage 3: Risk Filtering
 
-### Purpose
+### Processing order
 
-Sentiment provides context the price data alone cannot. A rising price with overwhelmingly negative news (e.g., regulatory action) is a different signal to a rising price with positive fundamentals.
+`risk_service.filter_decisions(decisions, market_data)` processes decisions in this order:
 
-### Sources and weights
+**First pass — stop-loss / take-profit check for existing positions:**
 
-All sources are averaged equally — there is no per-source weighting:
+For each symbol with an open position, `check_exit_conditions(symbol, price)` is called using the current price from `market_data`. If triggered, the AI's decision for that symbol is **replaced** with a SELL order. The AI never gets to override a stop-loss.
 
-```python
-blended = mean([rss_score, reddit_score, fear_greed_score])
-```
+**Second pass — evaluate each decision:**
 
-Each source produces a score in `[-1, 1]`:
+For each decision (that wasn't replaced by a stop-loss):
 
-- **RSS**: TextBlob polarity of crypto news article titles/summaries matching the symbol's keywords
-- **Reddit**: TextBlob polarity of Reddit post titles, weighted by upvotes
-- **Fear & Greed**: `(index_value - 50) / 50` where index_value is 0–100
+1. **Kill switch** — any action → HOLD. Hot-reload: reads env var at call time.
+2. **HOLD** — passed through unchanged (no further checks needed).
+3. **BUY while holding** → HOLD. Prevents stacking positions on the same asset.
+4. **SELL without position** → HOLD. Prevents phantom sells (no position to close).
+5. **Confidence check** — below `MIN_CONFIDENCE` → HOLD.
+6. **Size cap** — `size_pct > MAX_POSITION_PCT` → silently capped to `MAX_POSITION_PCT`.
+7. **Exposure cap** — for BUY only: compute `current_exposure = sum(all open size_pcts)`. If `current_exposure >= MAX_TOTAL_EXPOSURE_PCT` → HOLD. If `current_exposure + proposed_size_pct > MAX_TOTAL_EXPOSURE_PCT` → reduce `size_pct` to available headroom.
 
-A score of `0.0` means neutral. Positive means bullish sentiment. Negative means bearish.
+### Exposure cap example
 
-### How Claude uses it
+Settings: `MAX_TOTAL_EXPOSURE_PCT=60`, `MAX_POSITION_PCT=20`. Current positions:
+- BTCUSDT: 20%
+- ETHUSDT: 20%
 
-Sentiment appears in the prompt as a single number and a list of headlines. Claude synthesises this with the price data to form its reasoning. The bot does not interpret sentiment directly — it passes it to Claude and Claude decides how to weight it.
+Total exposure: 40%. Headroom: 20%.
 
-### Limitations
+Claude proposes `SOLUSDT BUY size_pct=20`. Risk evaluation:
+- `current_exposure = 40%`
+- `headroom = 60 - 40 = 20%`
+- `proposed_size_pct = min(20, 20) = 20%`
+- Approved with `size_pct=20`
 
-TextBlob is a general-purpose NLP library. It was not trained on financial text. A headline like "Bitcoin crashes below $90k" scores negatively (correct), but "Bitcoin hodlers stay strong despite crash" may score positively due to words like "strong" — which is misleading. Sentiment is a noisy signal that Claude should treat as one data point, not a primary driver.
+If Claude proposes `SOLUSDT BUY size_pct=20` but BTCUSDT is 30%:
+- `headroom = 60 - 50 = 10%`
+- `size_pct` is reduced from 20 → 10
 
----
-
-## 3. Risk Management
-
-### Kill switch
-
-`KILL_SWITCH` is read fresh from the environment on every decision evaluation:
-
-```python
-def _kill_switch_active() -> bool:
-    return os.getenv("KILL_SWITCH", "false").lower() == "true"
-```
-
-This means you can set `KILL_SWITCH=true` in your `.env` file and send a SIGHUP (or just save the file if using `--reload`) to halt all new positions immediately, without restarting the process. All BUY and SELL decisions are converted to HOLD while the switch is active.
-
-### Entry guard
-
-```python
-if action == "BUY" and asset in self._positions:
-    return HOLD("Already holding — skipping BUY to avoid stacking.")
-```
-
-This prevents buying more of an asset you already hold. The bot uses fixed-fraction sizing — a second BUY would effectively double exposure without the AI having intended that. If Claude sees a continuing opportunity and returns BUY for an already-held asset, this guard converts it to HOLD until the position is closed.
-
-### Exit guard
-
-```python
-if action == "SELL" and asset not in self._positions:
-    return HOLD("No open position — ignoring SELL.")
-```
-
-Prevents issuing a sell order when there is nothing to sell. Without this, the bot could attempt to place a sell order for an asset it doesn't hold, which would either be rejected by the exchange or sell borrowed assets (margin trading, which is not intended here).
-
-### Confidence threshold
-
-`MIN_CONFIDENCE` (default 0.7) is enforced by the bot independently of Claude's own self-filtering. This is a double safety net. A decision only acts when Claude's confidence is at least 70%.
-
-### Position sizing
-
-The approved `size_pct` is the minimum of:
-- Claude's recommended `size_pct`
-- `MAX_POSITION_PCT` (default 20%)
-- Available headroom under `MAX_TOTAL_EXPOSURE_PCT` (default 60%)
-
-Example: if you already hold 50% exposure and `MAX_TOTAL_EXPOSURE_PCT=60`, a new BUY can use at most 10% even if Claude recommended 15%.
-
-### Stop-loss (real-time)
-
-On every WebSocket tick for a symbol with an open position:
-
-```
-drawdown_pct = (entry_price - current_price) / entry_price * 100
-
-if drawdown_pct >= STOP_LOSS_PCT:
-    → remove position from memory immediately
-    → dispatch SELL order to TriggerExecutor queue
-```
-
-The position is removed **before** the order reaches the executor. This prevents a second WebSocket tick (arriving milliseconds later) from detecting the same drawdown and dispatching a second SELL order.
-
-### Take-profit (real-time)
-
-```
-gain_pct = (current_price - entry_price) / entry_price * 100
-
-if TAKE_PROFIT_PCT > 0 and gain_pct >= TAKE_PROFIT_PCT:
-    → same mechanism as stop-loss
-```
-
-`TAKE_PROFIT_PCT=0` disables this entirely. The check `settings.take_profit_pct > 0` ensures zero does not accidentally trigger on any gain.
+If total exposure is already at 60%:
+- `headroom = 0` → HOLD, cannot open.
 
 ---
 
-## 4. Execution Mechanics
+## Stage 4: Execution
 
-### Order quantity
+### Mode selection
 
-```python
-qty = portfolio_usdt * (size_pct / 100.0) / current_price
-```
-
-This is **fixed-fraction position sizing**. The position is sized as a fixed percentage of the total USDT balance, regardless of the asset's price or volatility.
-
-Example:
-- Portfolio: $10,000 USDT
-- BUY ETHUSDT at size_pct=10
-- Price: $1,742.30
-- USDT to spend: $10,000 × 10% = $1,000
-- Quantity: $1,000 / $1,742.30 = **0.5739 ETH**
-
-The bot does not adjust position sizes for volatility or risk-per-trade. Adding ATR-based sizing or Kelly criterion would be a meaningful upgrade.
+Mode is determined by `settings.paper_trading` (from `PAPER_TRADING` env var). This is evaluated at process start, not per-decision. The mode cannot be changed without restarting.
 
 ### Paper trading
 
-In paper mode, no HTTP call is made to Binance. A synthetic order is constructed:
-
 ```python
-{
-    "id": "PAPER-<ISO timestamp>",
-    "symbol": "ETHUSDT",
-    "side": "buy",
+qty = portfolio_usdt * (size_pct / 100.0) / price
+order = {
+    "id": f"PAPER-{timestamp}",
+    "symbol": asset,
+    "side": "buy" | "sell",
     "type": "market",
-    "qty": 0.5739,
-    "price": 1742.30,     ← WebSocket last price at time of execution
+    "qty": qty,
+    "price": price,      # uses last_price from MarketStateStore
     "status": "paper_filled",
 }
 ```
 
-Slippage and fees are recorded as zero. In reality, a market order will fill at a slightly worse price than the quoted price due to:
-- **Spread**: you buy at the ask, not the mid-price
-- **Market impact**: large orders move the order book
-- **Exchange fees**: Binance charges 0.1% per trade (0.075% with BNB)
+The price used for quantity calculation and the simulated fill price is the `last_price` from the WebSocket at the time of the cycle. This is **not** a guaranteed fill price — in live trading, slippage would apply.
 
-The paper USDT balance (`PAPER_BALANCE_USDT`) is a static configured constant. It does not decrease when you buy or increase when you sell. Paper trading tracks position state in memory only — it does not simulate a changing balance.
+No slippage simulation is performed. `fees_paid` and `slippage` are both stored as `0` in the database.
 
 ### Live trading
 
 ```python
-order = get_exchange().create_market_order(
-    symbol="ETH/USDT",
-    side="buy",
-    amount=0.5739,         ← quantity in base currency
-)
-filled_price = float(order.get("average") or current_price)
+ccxt_symbol = f"{asset[:-4]}/USDT"   # BTCUSDT → BTC/USDT
+qty = portfolio_usdt * (size_pct / 100.0) / price
+order = get_exchange().create_market_order(ccxt_symbol, side, qty)
+filled_price = float(order.get("average") or price)
 ```
 
-`create_market_order()` sends a market order via Binance REST API. The response includes the actual fill details. If the order is partially filled (rare for liquid markets), `order["average"]` is the weighted average fill price.
+`create_market_order` places a market order at Binance's current best price. `order["average"]` is the volume-weighted average fill price for partially-filled orders.
 
-The actual filled price is used for position tracking (not the price at decision time). This keeps stop-loss calculations accurate.
+For live mode, the bot needs `BINANCE_API_KEY` and `BINANCE_API_SECRET` in `.env`, and `PAPER_TRADING=false`.
 
-### Status values
+### Position tracking update
 
-| Status | Meaning |
-|---|---|
-| `paper_filled` | Paper trade — synthetic fill at last price |
-| `filled` | Live trade — actually filled on exchange |
-| `rejected` | Live trade — ccxt raised an error |
-| `none` | HOLD decision — no order placed |
+After execution (both modes), `_update_positions` is called:
+- BUY → `risk_service.record_open_position(asset, price, size_pct)`
+- SELL → `risk_service.close_position(asset)`
+
+This keeps `RiskService._positions` in sync. Critically, this state is **only in memory** and is lost on process restart.
+
+---
+
+## Stop-Loss Logic
+
+Stop-loss is checked in two contexts: real-time (every WebSocket tick) and hourly (in the trading cycle).
+
+### Real-time stop-loss (per tick)
+
+```python
+drawdown_pct = (entry_price - current_price) / entry_price * 100
+if drawdown_pct >= STOP_LOSS_PCT:
+    # trigger exit
+```
+
+Example: Entry at $67,423. `STOP_LOSS_PCT=5`. Exit triggers when price falls to:
+```
+$67,423 × (1 - 0.05) = $64,051.85
+```
+
+The check fires on every WebSocket tick for every open position. Binance sends `@ticker` updates roughly every second, so the maximum delay between the threshold being breached and the exit firing is approximately 1 second.
+
+### Hourly stop-loss (cycle check)
+
+The same `check_exit_conditions` method is called at the start of each hourly cycle via `check_stop_losses(market_data)`. This catches cases where:
+- The real-time check was missed (e.g. WebSocket disconnected during the breach)
+- A position was opened in a previous cycle and the real-time check wasn't active at the time
+
+In practice, if the real-time check fires, the position is removed from `_positions` immediately, so the hourly check will find nothing to trigger.
+
+### Take-profit logic
+
+Symmetric to stop-loss but for upside:
+
+```python
+gain_pct = (current_price - entry_price) / entry_price * 100
+if TAKE_PROFIT_PCT > 0 and gain_pct >= TAKE_PROFIT_PCT:
+    # trigger exit
+```
+
+`TAKE_PROFIT_PCT=0` (the default) **disables** take-profit entirely. Set to a positive value (e.g. `10`) to exit when the position gains 10%.
+
+---
+
+## HOLD semantics
+
+HOLD is not a no-op in all contexts:
+- The AI validator emits HOLD when confidence is below threshold
+- The risk layer emits HOLD when a rule is violated (but marks it approved)
+- HOLD decisions are still persisted to the database (AIDecision + Execution records are written)
+- HOLD decisions are still logged to `trades.jsonl`
+- The execution record for a HOLD gets `status="none"` and `execution_time=None`
+
+This means every cycle always produces a full DB record for every tracked symbol, regardless of action.
+
+---
+
+## Summary: Decision Fate Matrix
+
+| Scenario | AI action | After risk filter | After execution |
+|---|---|---|---|
+| High confidence, no position | BUY | BUY (possibly size-adjusted) | Paper/live order placed, position recorded |
+| High confidence, already holding | BUY | HOLD (double-entry guard) | Logged as HOLD |
+| Low confidence | BUY | HOLD (confidence floor) | Logged as HOLD |
+| Has position, AI says SELL | SELL | SELL | Order placed, position closed |
+| No position, AI says SELL | SELL | HOLD (phantom sell guard) | Logged as HOLD |
+| Stop-loss breaches (real-time) | — | SELL (overrides AI) | Exit order via TriggerExecutor |
+| Stop-loss breaches (hourly) | — | SELL (overrides AI decision) | Exit order in cycle |
+| Kill switch active | any | HOLD | Logged as HOLD |
+| AI API failure | — | HOLD (fallback) | Logged as HOLD |
+| Portfolio at exposure cap | BUY | HOLD | Logged as HOLD |

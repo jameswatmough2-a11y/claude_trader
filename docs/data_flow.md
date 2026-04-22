@@ -1,314 +1,355 @@
 # Data Flow
 
-This document traces every piece of data through the system, from raw exchange packets to database rows.
+This document traces every piece of data through the system, from the raw Binance WebSocket packet to the database row and API response.
 
 ---
 
-## Overview
+## High-Level Flow
 
 ```
 Binance Exchange
       │
-      │  WebSocket frames (~1s per symbol)
+      │  WebSocket @ticker events (continuous)
       ▼
 BinanceWebSocketService._handle_message()
       │
-      ├──► MarketStateStore.update()         [in-memory, keyed by symbol]
+      ├─► MarketStateStore.update()
+      │        ↑ read by TradingCycleService._build_market_data()
       │
-      └──► RiskService.check_exit_conditions()
-                  │
-                  └──► asyncio.Queue (if triggered)
-                              │
-                              ▼
-                        TriggerExecutor._execute()
-                              │
-                              └──► ExecutionService.execute_decision()
-                                          │
-                                          ├──► logs/trades.jsonl  [file append]
-                                          └──► RiskService._positions  [in-memory]
+      └─► RiskService.check_exit_conditions()
+               │
+               │ (if stop-loss / take-profit triggered)
+               ▼
+          trigger_queue.put_nowait(order)
+               │
+               ▼
+          TriggerExecutor._execute()
+               │
+               ▼
+          ExecutionService.execute_decision()
+               │
+               ├─► logs/trades.jsonl
+               └─► RiskService._positions (update)
 
 
-APScheduler (every 60 minutes from startup)
+APScheduler (every hour)
       │
       ▼
-TradingCycleService.run()
+TradingCycleService.run(db)
       │
-      ├── MarketStateStore.all()             [read in-memory cache]
-      │         │
-      │         └── market_data dict         [Python dict, passed around]
+      ├─► MarketStateStore.all()          → market_data dict
       │
-      ├── SentimentService.get_all_sentiment()
-      │         │
-      │         ├── feedparser (RSS HTTP)
-      │         ├── requests (Reddit JSON API)
-      │         ├── requests (Fear & Greed API)
-      │         └── AssetSentiment objects   [passed to AI]
+      ├─► SentimentService
+      │     ├─► RSS feeds (HTTP)           → per-asset headline scores
+      │     ├─► Reddit JSON API (HTTP)     → per-asset post scores
+      │     └─► Fear & Greed API (HTTP)    → global score
+      │         → dict[str, AssetSentiment]
       │
-      ├── AIService.get_trading_decisions()
-      │         │
-      │         ├── Anthropic Claude API (HTTPS)
-      │         └── list[dict] decisions     [validated JSON decisions]
+      ├─► ai_service.get_trading_decisions()
+      │     ├─► _build_prompt(market_data, sentiment_data) → string
+      │     ├─► anthropic.messages.create()  → raw text
+      │     ├─► _extract_json()              → JSON string
+      │     └─► _validate_decisions()        → list[dict]
       │
-      ├── RiskService.filter_decisions()
-      │         │
-      │         └── list[dict] filtered      [approved decisions]
+      ├─► RiskService.filter_decisions()
+      │     ├─► check_stop_losses()          → stop-loss SELL orders
+      │     └─► evaluate_decision()          → approved/adjusted decisions
       │
-      ├── data_feeds.fetch_balance()
-      │         │
-      │         └── balance dict             [USDT total/free]
+      ├─► data_feeds.fetch_balance()         → balance dict
       │
-      └── _persist_cycle() per symbol
-                │
-                ├── ExecutionService.execute_decision()
-                │         │
-                │         └── logs/trades.jsonl  [file append]
-                │
-                └── SQLAlchemy session
-                          │
-                          ├── HourlyMarketSnapshot row
-                          ├── Position row
-                          ├── AIDecision row
-                          └── Execution row
+      └─► For each decision:
+            ExecutionService.execute_decision()
+              ├─► logs/trades.jsonl
+              └─► RiskService._positions (update)
+            _persist_cycle(db, ...)
+              └─► SQLite
+                    ├─► assets
+                    ├─► hourly_market_snapshots
+                    ├─► positions
+                    ├─► ai_decisions
+                    └─► executions
 
 
-REST API (on-demand HTTP request)
+HTTP Client
       │
-      └── SQLAlchemy query → JSON response
+      ▼
+FastAPI routes
+      │
+      └─► SQLAlchemy Session → SQLite
+            ├─► GET /assets      → assets table
+            ├─► GET /positions   → positions table
+            └─► GET /decisions   → ai_decisions table
 ```
 
 ---
 
-## Data Formats at Each Stage
+## Step-by-Step: WebSocket Tick → Market State
 
-### 1. Raw WebSocket Payload
-
-Binance sends one JSON object per symbol per combined stream message:
-
+**Raw Binance message** (combined stream envelope):
 ```json
 {
   "stream": "btcusdt@ticker",
   "data": {
-    "e": "24hrTicker",
     "s": "BTCUSDT",
-    "c": "93142.50",
-    "b": "93140.00",
-    "a": "93145.00",
-    "h": "94200.00",
-    "l": "92100.00",
-    "q": "1482934200.50",
-    "P": "-0.42"
+    "c": "67423.0100",
+    "b": "67422.9900",
+    "a": "67423.0100",
+    "q": "1234567890.00",
+    "P": "-0.842",
+    "h": "68500.0000",
+    "l": "66200.0000"
   }
 }
 ```
 
-Key fields used: `s` (symbol), `c` (last price), `b` (bid), `a` (ask), `h` (24h high), `l` (24h low), `q` (24h quote volume), `P` (24h % change).
+**After `_handle_message` parsing:**
+```python
+market_store.update(
+    symbol="BTCUSDT",
+    last_price=Decimal("67423.0100"),
+    bid=Decimal("67422.9900"),
+    ask=Decimal("67423.0100"),
+    volume_24h=Decimal("1234567890.00"),
+    price_change_24h_pct=Decimal("-0.842"),
+    high_24h=Decimal("68500.0000"),
+    low_24h=Decimal("66200.0000"),
+)
+```
 
-### 2. MarketStateStore Entry
-
-After parsing, each symbol becomes a `SymbolMarketState`:
-
+**State in `MarketStateStore._state["BTCUSDT"]`:**
 ```python
 SymbolMarketState(
     symbol="BTCUSDT",
-    last_price=Decimal("93142.50"),
-    bid=Decimal("93140.00"),
-    ask=Decimal("93145.00"),
-    volume_24h=Decimal("1482934200.50"),
-    price_change_24h_pct=Decimal("-0.42"),
-    high_24h=Decimal("94200.00"),
-    low_24h=Decimal("92100.00"),
-    updated_at=datetime(2026, 4, 22, 19, 0, 1, tzinfo=timezone.utc),
+    last_price=Decimal("67423.0100"),
+    bid=Decimal("67422.9900"),
+    ask=Decimal("67423.0100"),
+    volume_24h=Decimal("1234567890.00"),
+    price_change_24h_pct=Decimal("-0.842"),
+    high_24h=Decimal("68500.0000"),
+    low_24h=Decimal("66200.0000"),
+    updated_at=datetime(2026, 4, 22, 14, 0, 1, tzinfo=UTC),
 )
 ```
 
-All price fields are stored as `Decimal` to avoid floating-point rounding errors.
+---
 
-### 3. Market Data Dict (Trading Cycle Input)
+## Step-by-Step: Market State → AI Prompt
 
-`_build_market_data()` converts the store into a plain dict that AI and risk services consume:
-
+**`TradingCycleService._build_market_data()` output:**
 ```python
 {
-    "BTCUSDT": {
-        "symbol": "BTCUSDT",
-        "last_price": 93142.50,       # float (converted from Decimal)
-        "bid": 93140.0,
-        "ask": 93145.0,
-        "volume_24h": 1482934200.5,
-        "price_change_24h_pct": -0.42,
-        "high_24h": 94200.0,
-        "low_24h": 92100.0,
-        "quote_volume_24h": 1482934200.5,
-        "ohlcv": {
-            "last_close": 93142.50,
-            "high_24h": 94200.0,
-            "low_24h": 92100.0,
-            "avg_volume_24h": 1482934200.5,
-            "price_change_pct_24h": -0.42,
-        },
-        "orderbook": {},
-    }
+  "BTCUSDT": {
+    "symbol": "BTCUSDT",
+    "last_price": 67423.01,
+    "bid": 67422.99,
+    "ask": 67423.01,
+    "volume_24h": 1234567890.0,
+    "price_change_24h_pct": -0.842,
+    "high_24h": 68500.0,
+    "low_24h": 66200.0,
+    "quote_volume_24h": 1234567890.0,
+    "ohlcv": {
+      "last_close": 67423.01,
+      "high_24h": 68500.0,
+      "low_24h": 66200.0,
+      "avg_volume_24h": 1234567890.0,
+      "price_change_pct_24h": -0.842,
+    },
+    "orderbook": {},
+  }
 }
 ```
 
-The `ohlcv` sub-dict exists for AI prompt compatibility — the AI prompt reads from `ohlcv.high_24h` etc. Since we only have WebSocket data (not OHLCV candles), these are derived from the 24h ticker fields.
+Note: `open_price`, `high_price`, `low_price`, `close_price` in the database snapshot are all set to `last_price` from this dict. The `high` and `low` in the `ohlcv` sub-dict come from `high_24h` / `low_24h`.
 
-### 4. Sentiment Data (AssetSentiment Objects)
-
-```python
-AssetSentiment(
-    symbol="BTCUSDT",
-    score=0.124,              # blended sentiment [-1, 1]
-    headline_count=8,
-    top_headlines=[
-        "Bitcoin surges past $93k as institutional demand grows",
-        "BTC dominance reaches 52% amid altcoin weakness",
-    ],
-    source_scores={
-        "rss": 0.21,
-        "reddit": 0.08,
-        "fear_greed": 0.06,   # (Fear & Greed 53 → (53-50)/50 = 0.06)
-    },
-    fear_greed_index=53,
-)
+**Prompt fragment for BTCUSDT:**
 ```
-
-### 5. AI Prompt (sent to Claude)
-
-```
-=== HOURLY TRADING ANALYSIS — 2026-04-22 19:00 UTC ===
-
-Analyse the following data and return one JSON decision per asset.
-
 --- BTCUSDT ---
-Price: $93,142.5000  Bid: $93,140.0000  Ask: $93,145.0000
-24h High: $94,200.0000  24h Low: $92,100.0000  Change: -0.42%
-Avg 24h Volume: 1,482,934,200  Quote Volume: $1,482,934,200
-Sentiment: 0.124 | Fear & Greed: 53/100
-  1. Bitcoin surges past $93k as institutional demand grows
-  2. BTC dominance reaches 52% amid altcoin weakness
-
---- ETHUSDT ---
-...
-
-Return ONLY a JSON array.
+Price: $67,423.0100  Bid: $67,422.9900  Ask: $67,423.0100
+24h High: $68,500.0000  24h Low: $66,200.0000  Change: -0.842%
+Avg 24h Volume: 1,234,568  Quote Volume: $1,234,567,890
+Sentiment: 0.123 | Fear & Greed: 62/100
+  1. Bitcoin ETF inflows reach record high this week
+  2. BTC holds above key $67k support level
+  3. Institutional interest continues to drive BTC demand
 ```
 
-### 6. AI Response (raw JSON from Claude)
+---
 
+## Step-by-Step: AI Response → Validated Decisions
+
+**Raw Claude response text:**
+```
+[{"asset": "BTCUSDT", "action": "BUY", "confidence": 0.82, "size_pct": 15, "reasoning": "Strong momentum and positive sentiment."}, {"asset": "ETHUSDT", "action": "HOLD", "confidence": 0.54, "size_pct": 0, "reasoning": "Confidence below threshold."}, {"asset": "SOLUSDT", "action": "SELL", "confidence": 0.91, "size_pct": 10, "reasoning": "Bearish 24h trend warrants position reduction."}]
+```
+
+**After `_validate_decisions()`:**
+```python
+[
+    {"asset": "BTCUSDT", "action": "BUY",  "confidence": 0.82, "size_pct": 15, "reasoning": "Strong momentum and positive sentiment."},
+    {"asset": "ETHUSDT", "action": "HOLD", "confidence": 0.54, "size_pct": 0,  "reasoning": "Confidence below threshold."},  # confidence < 0.7, forced HOLD
+    {"asset": "SOLUSDT", "action": "SELL", "confidence": 0.91, "size_pct": 10, "reasoning": "Bearish 24h trend warrants position reduction."},
+]
+```
+
+If ETHUSDT were missing from Claude's response entirely:
+```python
+{"asset": "ETHUSDT", "action": "HOLD", "confidence": 0.0, "size_pct": 0, "reasoning": "Missing from model response — defaulted to HOLD."}
+```
+
+---
+
+## Step-by-Step: Decisions → Risk-Filtered Decisions
+
+Input (from AI validator, no positions currently open):
+```python
+[
+    {"asset": "BTCUSDT", "action": "BUY",  "confidence": 0.82, "size_pct": 15},
+    {"asset": "ETHUSDT", "action": "HOLD", "confidence": 0.54, "size_pct": 0},
+    {"asset": "SOLUSDT", "action": "SELL", "confidence": 0.91, "size_pct": 10},
+]
+```
+
+Risk check results:
+- BTCUSDT BUY: no existing position, confidence OK, size OK, exposure OK → **approved BUY size=15**
+- ETHUSDT HOLD: pass-through → **HOLD**
+- SOLUSDT SELL: no open position → phantom sell guard → **forced HOLD**, reasoning updated
+
+Output:
+```python
+[
+    {"asset": "BTCUSDT", "action": "BUY",  "confidence": 0.82, "size_pct": 15, "reasoning": "Strong momentum and positive sentiment."},
+    {"asset": "ETHUSDT", "action": "HOLD", "confidence": 0.54, "size_pct": 0,  "reasoning": "Confidence below threshold."},
+    {"asset": "SOLUSDT", "action": "HOLD", "confidence": 0.91, "size_pct": 0,  "reasoning": "No open position for SOLUSDT — ignoring SELL."},
+]
+```
+
+---
+
+## Step-by-Step: Execution → Trade Log
+
+**Paper execution for BTCUSDT BUY:**
+
+Inputs:
+- `portfolio_usdt = 10000.0`
+- `size_pct = 15`
+- `price = 67423.01`
+
+Calculation:
+```
+qty = 10000 × 0.15 / 67423.01 = 0.022247 BTC
+```
+
+**Trade log entry (`logs/trades.jsonl`):**
 ```json
-[
-  {
-    "asset": "BTCUSDT",
-    "action": "HOLD",
-    "confidence": 0.72,
-    "size_pct": 0,
-    "reasoning": "Price retreating from recent high with mild negative 24h change. Waiting for clearer momentum signal."
-  },
-  {
-    "asset": "ETHUSDT",
-    "action": "BUY",
-    "confidence": 0.81,
-    "size_pct": 10,
-    "reasoning": "Positive sentiment and stable volume suggest accumulation opportunity."
-  },
-  {
-    "asset": "SOLUSDT",
-    "action": "HOLD",
-    "confidence": 0.65,
-    "size_pct": 0,
-    "reasoning": "Confidence below threshold — insufficient data signal."
-  }
-]
-```
-
-### 7. Validated Decisions (after _validate_decisions)
-
-```python
-[
-    {"asset": "BTCUSDT", "action": "HOLD", "confidence": 0.72, "size_pct": 0, "reasoning": "..."},
-    {"asset": "ETHUSDT", "action": "BUY",  "confidence": 0.81, "size_pct": 10, "reasoning": "..."},
-    {"asset": "SOLUSDT", "action": "HOLD", "confidence": 0.0,  "size_pct": 0,
-     "reasoning": "Confidence 0.65 below minimum 0.7 — forcing HOLD."},
-]
-```
-
-SOLUSDT's action was changed from the raw Claude response because confidence was below `MIN_CONFIDENCE`.
-
-### 8. Filtered Decisions (after RiskService.filter_decisions)
-
-Assuming no open positions and no stop-losses triggered:
-
-```python
-[
-    {"asset": "BTCUSDT", "action": "HOLD", "size_pct": 0, ...},
-    {"asset": "ETHUSDT", "action": "BUY",  "size_pct": 10, ...},  # passes all checks
-    {"asset": "SOLUSDT", "action": "HOLD", "size_pct": 0, ...},
-]
-```
-
-### 9. Execution Result (paper mode)
-
-```python
 {
-    "timestamp": "2026-04-22T19:00:45Z",
-    "asset": "ETHUSDT",
-    "action": "BUY",
-    "confidence": 0.81,
-    "size_pct": 10,
-    "current_price": 1742.30,
-    "portfolio_usdt": 10000.0,
-    "reasoning": "Positive sentiment...",
-    "paper_trading": True,
-    "order": {
-        "id": "PAPER-2026-04-22T19:00:45Z",
-        "symbol": "ETHUSDT",
-        "side": "buy",
-        "type": "market",
-        "qty": 5.739,           # 10000 * 0.10 / 1742.30
-        "price": 1742.30,
-        "status": "paper_filled",
-    },
-    "error": None,
+  "timestamp": "2026-04-22T14:00:01.234567+00:00",
+  "asset": "BTCUSDT",
+  "action": "BUY",
+  "confidence": 0.82,
+  "size_pct": 15,
+  "current_price": 67423.01,
+  "portfolio_usdt": 10000.0,
+  "reasoning": "Strong momentum and positive sentiment.",
+  "paper_trading": true,
+  "order": {
+    "id": "PAPER-2026-04-22T14:00:01.234567+00:00",
+    "symbol": "BTCUSDT",
+    "side": "buy",
+    "type": "market",
+    "qty": 0.022247,
+    "price": 67423.01,
+    "status": "paper_filled"
+  },
+  "error": null
 }
 ```
 
-### 10. Database Rows (per symbol per cycle)
+---
 
+## Step-by-Step: Execution → Database
+
+After execution, `_persist_cycle` writes to four tables. For BTCUSDT BUY (paper filled):
+
+**`assets` table (upserted):**
 ```
-HourlyMarketSnapshot:
-  asset_id=2, snapshot_time=2026-04-22T19:00:00Z,
-  open=1742.30, high=1760.00, low=1730.50, close=1742.30,
-  volume=982341200.00
-
-Position:
-  snapshot_id=<snapshot.id>, asset_id=2,
-  side="flat", size=0, entry_price=NULL,
-  wallet_balance=10000.00
-
-AIDecision:
-  snapshot_id=<snapshot.id>, prompt_version="v1",
-  model_name="claude-sonnet-4-6", action="BUY",
-  confidence_score=0.8100, reasoning_summary="Positive sentiment...",
-  recommended_size=10.00
-
-Execution:
-  ai_decision_id=<decision.id>, executed_action="BUY",
-  executed_size=5.73900000, execution_price=1742.30000000,
-  fees_paid=0, slippage=0,
-  execution_time=2026-04-22T19:00:45Z, status="paper_filled"
+id=1, symbol="BTCUSDT", base_currency="BTC", quote_currency="USDT"
 ```
 
-### 11. API Response (GET /decisions)
+**`hourly_market_snapshots` table:**
+```
+id=1, asset_id=1, snapshot_time="2026-04-22T14:00:00+00:00",
+open_price=67423.01, high_price=68500.0, low_price=66200.0, close_price=67423.01,
+volume=1234567890.0, price_change_1h_pct=NULL, price_change_since_entry_pct=NULL
+```
 
+**`positions` table:**
+```
+id=1, snapshot_id=1, asset_id=1,
+side="flat", size=0.0, entry_price=NULL,
+unrealized_pnl=NULL, wallet_balance=10000.0
+```
+
+Note: `side="flat"` always. The DB position record does not reflect the just-executed BUY. Position tracking is in-memory only (see [persistence.md](persistence.md)).
+
+**`ai_decisions` table:**
+```
+id=1, snapshot_id=1, prompt_version="v1", model_name="claude-sonnet-4-6",
+action="BUY", confidence_score=0.82,
+reasoning_summary="Strong momentum and positive sentiment.",
+recommended_size=15, recommended_stop_loss=NULL, recommended_take_profit=NULL,
+created_at="2026-04-22T14:00:00+00:00"
+```
+
+**`executions` table:**
+```
+id=1, ai_decision_id=1,
+executed_action="BUY", executed_size=0.022247, execution_price=67423.01,
+fees_paid=0.0, slippage=0.0,
+execution_time="2026-04-22T14:00:00+00:00",
+status="paper_filled"
+```
+
+---
+
+## Step-by-Step: Database → API Response
+
+**`GET /decisions`:**
 ```json
 [
   {
-    "id": 7,
-    "snapshot_id": 12,
+    "id": 1,
+    "snapshot_id": 1,
     "action": "BUY",
-    "confidence_score": 0.81,
-    "reasoning_summary": "Positive sentiment and stable volume suggest accumulation opportunity."
+    "confidence_score": 0.82,
+    "reasoning_summary": "Strong momentum and positive sentiment."
+  },
+  {
+    "id": 2,
+    "snapshot_id": 2,
+    "action": "HOLD",
+    "confidence_score": 0.54,
+    "reasoning_summary": "Confidence below threshold."
   }
 ]
 ```
+
+---
+
+## Data Precision Notes
+
+- All prices are stored in SQLite as `Numeric(20, 8)` — 20 total digits, 8 decimal places.
+- Values flow through the system as `Decimal` (WebSocket → market store), converted to `float` for the AI prompt and risk calculations, then back to `Decimal` for DB writes.
+- The conversion `Decimal(str(float_value))` is used consistently to avoid floating-point precision surprises when wrapping `float` back to `Decimal`.
+
+## Data That Is Never Persisted
+
+| Data | Where it lives | Lost on restart |
+|---|---|---|
+| Open position state | `RiskService._positions` | Yes |
+| Current prices | `MarketStateStore._state` | Yes (repopulated by WebSocket) |
+| Pending exit orders | `trigger_queue` | Yes |
+| Paper balance | Computed from `PAPER_BALANCE_USDT` each cycle | N/A (not stateful) |
+| Actual filled quantity after live trade | Only in `trades.jsonl` and `executions` table | No |
+
+See [persistence.md](persistence.md) for full details.

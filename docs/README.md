@@ -1,46 +1,8 @@
-# Claude Trader — Documentation
+# Claude Trader — Developer Documentation
 
-Claude Trader is a prototype cryptocurrency trading bot. It connects to Binance via WebSocket for live prices, asks Claude AI for hourly trading decisions, applies a risk management layer, and executes paper (or live) trades. The system is built as a FastAPI application with an async event loop driving two concurrent loops: a continuous price stream and an hourly decision cycle.
+Claude Trader is a prototype cryptocurrency trading bot. It connects to Binance via a persistent WebSocket for real-time price data, asks Claude AI for hourly trading decisions, applies a layered risk management system, and executes paper or live trades.
 
----
-
-## Stack
-
-| Layer | Technology |
-|---|---|
-| Web framework | FastAPI + Uvicorn |
-| AI decisions | Anthropic Claude (`claude-sonnet-4-6`) |
-| Exchange | Binance via WebSocket + ccxt |
-| Scheduler | APScheduler (`AsyncIOScheduler`) |
-| Database | SQLite via SQLAlchemy 2.0 (ORM) |
-| Sentiment | TextBlob + feedparser + Reddit JSON API |
-| Config | `python-dotenv` + dataclass |
-
-**Status:** prototype. Paper trading is on by default. No real money moves unless you supply Binance API keys and set `PAPER_TRADING=false`.
-
----
-
-## Quick Start
-
-```bash
-# 1. Create and activate virtualenv
-python -m venv crypto_bot/env
-source crypto_bot/env/Scripts/activate   # Windows
-# source crypto_bot/env/bin/activate     # macOS / Linux
-
-# 2. Install dependencies
-pip install -r requirements.txt
-
-# 3. Configure
-cp crypto_bot/.env.example crypto_bot/.env
-# Set ANTHROPIC_API_KEY in crypto_bot/.env
-
-# 4. Run
-cd crypto_bot
-uvicorn app.main:app --reload
-```
-
-The first trading cycle fires immediately on startup. The server runs at `http://localhost:8000`.
+**Status:** prototype / paper trading by default. No real orders are placed unless you supply Binance API keys and explicitly set `PAPER_TRADING=false`.
 
 ---
 
@@ -48,58 +10,122 @@ The first trading cycle fires immediately on startup. The server runs at `http:/
 
 | File | What it covers |
 |---|---|
-| [architecture.md](architecture.md) | System layers, components, how they connect |
-| [workflow.md](workflow.md) | Step-by-step runtime flow from startup to execution |
-| [services.md](services.md) | Deep breakdown of every service class and module |
-| [trading_logic.md](trading_logic.md) | AI decisions, sentiment, risk rules, execution mechanics |
-| [data_flow.md](data_flow.md) | How data moves through the system end to end |
-| [configuration.md](configuration.md) | Every environment variable explained |
+| [architecture.md](architecture.md) | System layers, component map, dependency graph |
+| [workflow.md](workflow.md) | Step-by-step runtime: startup, continuous operation, hourly cycle |
+| [services.md](services.md) | Deep dive into every service: inputs, outputs, logic, edge cases |
+| [trading_logic.md](trading_logic.md) | AI prompt design, risk rules, execution sizing |
+| [data_flow.md](data_flow.md) | How data moves from WebSocket tick to database record |
+| [configuration.md](configuration.md) | Every environment variable, defaults, and behavioral impact |
 | [api.md](api.md) | REST endpoints with example requests and responses |
-| [persistence.md](persistence.md) | Database schema, in-memory state, restart behaviour |
-| [concurrency.md](concurrency.md) | WebSocket loop, scheduler, async queue, race conditions |
-| [limitations.md](limitations.md) | Honest prototype constraints and production gaps |
-| [upgrade_guide.md](upgrade_guide.md) | How to extend or replace any part of the system |
+| [persistence.md](persistence.md) | ORM models, what lives in the DB vs. in memory, restart behavior |
+| [concurrency.md](concurrency.md) | Async architecture, two concurrent loops, race condition handling |
+| [limitations.md](limitations.md) | Prototype constraints, things that would break in production |
+| [upgrade_guide.md](upgrade_guide.md) | How to extend the system: new assets, exchanges, AI providers |
 
 ---
 
-## Project Structure
+## Technology Stack
+
+| Layer | Technology |
+|---|---|
+| Web framework | FastAPI 0.136 + Uvicorn |
+| AI decisions | Anthropic Claude (`claude-sonnet-4-6`) via `anthropic` SDK 0.49 |
+| Exchange connectivity | Binance WebSocket (`wss://data-stream.binance.vision`) + ccxt 4.3 |
+| Task scheduler | APScheduler 3.10 (`AsyncIOScheduler`) |
+| Database | SQLite via SQLAlchemy 2.0 ORM |
+| Sentiment analysis | TextBlob + feedparser (RSS) + Reddit JSON API + Fear & Greed Index |
+| Configuration | `python-dotenv` + Python dataclass |
+| Async runtime | Python `asyncio` (single event loop, no threads except trigger executor) |
+
+---
+
+## Quick Start
+
+```bash
+# 1. Clone and enter the repo
+git clone <repo-url>
+cd claude_trader
+
+# 2. Create and activate a virtual environment
+python -m venv crypto_bot/env
+source crypto_bot/env/Scripts/activate    # Windows
+# source crypto_bot/env/bin/activate      # macOS / Linux
+
+# 3. Install dependencies
+pip install -r crypto_bot/requirements.txt
+
+# 4. Configure environment
+cp crypto_bot/.env.example crypto_bot/.env
+# Edit .env — at minimum, set ANTHROPIC_API_KEY
+
+# 5. Start the server
+cd crypto_bot
+uvicorn app.main:app --reload
+```
+
+The server starts at `http://localhost:8000`. API docs at `/docs`.
+
+The bot will:
+1. Initialize the SQLite database
+2. Connect to the Binance WebSocket price stream
+3. Run the first trading cycle immediately
+4. Run a trading cycle every subsequent hour
+
+---
+
+## Minimum Configuration
+
+```env
+ANTHROPIC_API_KEY=sk-ant-...
+PAPER_TRADING=true
+TRACKED_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT
+```
+
+With these three values set and Binance keys absent, the bot will:
+- Receive real Binance market prices via WebSocket
+- Ask Claude for trading decisions every hour
+- Log all decisions to `logs/trades.jsonl`
+- Store all decisions in `crypto_bot.db` (SQLite)
+- Never place a real order
+
+---
+
+## Project Layout
 
 ```
 claude_trader/
-├── requirements.txt
-├── README.md
-├── docs/                         ← you are here
-└── crypto_bot/
-    ├── .env.example
-    ├── .env                      ← your local config (not committed)
-    ├── logs/
-    │   └── trades.jsonl          ← execution log (appended each cycle)
-    └── app/
-        ├── main.py               ← FastAPI app, service wiring, lifespan
-        ├── config.py             ← Settings dataclass loaded from .env
-        ├── db/
-        │   ├── session.py        ← SQLAlchemy engine + SessionLocal
-        │   └── init_db.py        ← create tables on startup
-        ├── models/               ← ORM models
-        │   ├── asset.py
-        │   ├── hourly_market_snapshot.py
-        │   ├── position.py
-        │   ├── ai_decision.py
-        │   └── execution.py
-        ├── api/
-        │   └── routes/
-        │       ├── health.py
-        │       ├── assets.py
-        │       ├── positions.py
-        │       └── decisions.py
-        └── services/
-            ├── market_state.py
-            ├── binance_ws.py
-            ├── trigger_executor.py
-            ├── data_feeds.py
-            ├── sentiment_service.py
-            ├── ai_service.py
-            ├── risk_service.py
-            ├── execution_service.py
-            └── trading_cycle.py
+├── crypto_bot/
+│   ├── app/
+│   │   ├── main.py                 # FastAPI app + service wiring + startup/shutdown
+│   │   ├── config.py               # Settings dataclass loaded from .env
+│   │   ├── db/
+│   │   │   ├── session.py          # SQLAlchemy engine + SessionLocal factory
+│   │   │   └── init_db.py          # Creates tables on startup
+│   │   ├── models/                 # SQLAlchemy ORM models
+│   │   │   ├── asset.py
+│   │   │   ├── hourly_market_snapshot.py
+│   │   │   ├── position.py
+│   │   │   ├── ai_decision.py
+│   │   │   └── execution.py
+│   │   ├── api/
+│   │   │   ├── deps.py             # get_db dependency
+│   │   │   └── routes/             # REST endpoints
+│   │   │       ├── health.py
+│   │   │       ├── assets.py
+│   │   │       ├── positions.py
+│   │   │       └── decisions.py
+│   │   └── services/
+│   │       ├── market_state.py     # In-memory price cache
+│   │       ├── binance_ws.py       # Persistent WebSocket + real-time exit checks
+│   │       ├── trigger_executor.py # Async queue consumer for stop-loss / take-profit
+│   │       ├── data_feeds.py       # ccxt exchange factory + market data helpers
+│   │       ├── sentiment_service.py# RSS + Reddit + Fear & Greed sentiment scoring
+│   │       ├── ai_service.py       # Claude API call + prompt + response validation
+│   │       ├── risk_service.py     # Position tracking + risk rule enforcement
+│   │       ├── execution_service.py# Paper / live order placement
+│   │       └── trading_cycle.py   # Hourly orchestrator (data → AI → risk → execute → persist)
+│   ├── .env.example
+│   └── requirements.txt
+├── docs/                           # This documentation
+└── CLAUDE.md
 ```

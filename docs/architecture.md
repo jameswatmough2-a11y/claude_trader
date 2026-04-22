@@ -2,104 +2,228 @@
 
 ## System Overview
 
-Claude Trader is structured as a single FastAPI process containing three concurrent execution paths:
+Claude Trader is structured as a **single-process FastAPI application** running inside Python's `asyncio` event loop. Two concurrent async tasks run for the lifetime of the process:
 
-1. **WebSocket loop** — a persistent async connection to Binance, running every second
-2. **Hourly cycle** — APScheduler fires a sync trading cycle at startup then every 60 minutes
-3. **Trigger executor** — an async queue consumer that processes real-time exit orders
+1. **BinanceWebSocketService** — maintains a persistent WebSocket connection to Binance and processes every price tick
+2. **TriggerExecutor** — drains an `asyncio.Queue` of real-time exit orders (stop-loss / take-profit) produced by the WebSocket task
 
-These three paths share a small set of stateful objects injected at startup. Everything else is stateless.
+A third loop is driven by **APScheduler** once per hour:
+
+3. **TradingCycleService** — reads the current price cache, calls Claude, applies risk rules, executes decisions, and writes results to the database
+
+These are orchestrated from `app/main.py` via a FastAPI lifespan context manager.
 
 ---
 
 ## Layer Diagram
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        FastAPI Process                          │
-│                                                                 │
-│  ┌──────────────────┐   ┌──────────────────┐                   │
-│  │  Binance WebSocket│   │  APScheduler     │                   │
-│  │  (async loop)    │   │  (hourly trigger) │                   │
-│  └────────┬─────────┘   └────────┬─────────┘                   │
-│           │                      │                              │
-│           ▼                      ▼                              │
-│  ┌────────────────┐    ┌──────────────────────────────────┐     │
-│  │ MarketStateStore│◄───│       TradingCycleService        │     │
-│  │ (in-memory)    │    │  sentiment → AI → risk → execute │     │
-│  └────────┬───────┘    └──────────────────────────────────┘     │
-│           │                      │                              │
-│           │ price tick           │ decisions                    │
-│           ▼                      ▼                              │
-│  ┌─────────────────┐   ┌──────────────────┐                    │
-│  │  RiskService    │   │ ExecutionService  │                    │
-│  │  (positions)    │   │ (paper / live)   │                    │
-│  └────────┬────────┘   └────────┬─────────┘                    │
-│           │                     │                              │
-│           │ exit trigger        │                              │
-│           ▼                     │                              │
-│  ┌─────────────────┐            │                              │
-│  │ asyncio.Queue   │            │                              │
-│  └────────┬────────┘            │                              │
-│           ▼                     │                              │
-│  ┌─────────────────┐            │                              │
-│  │ TriggerExecutor │            │                              │
-│  │ (async)         │            │                              │
-│  └─────────────────┘            │                              │
-│                                 ▼                              │
-│                        ┌────────────────┐                      │
-│                        │   SQLite DB    │                      │
-│                        │  (SQLAlchemy)  │                      │
-│                        └────────────────┘                      │
-│                                 │                              │
-│                        ┌────────────────┐                      │
-│                        │   REST API     │                      │
-│                        │  /health etc.  │                      │
-│                        └────────────────┘                      │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                    FastAPI HTTP layer                        │
+│          /health  /assets  /positions  /decisions            │
+└────────────────────────┬────────────────────────────────────┘
+                         │ reads DB via SQLAlchemy
+┌────────────────────────▼────────────────────────────────────┐
+│                    Persistence layer                         │
+│             SQLite + SQLAlchemy ORM (5 tables)               │
+│   assets  /  hourly_market_snapshots  /  positions           │
+│   ai_decisions  /  executions                                │
+└───────────────────┬──────────────────────────────────────────┘
+          ▲ writes  │
+          │         │
+┌─────────┴────────────────┐       ┌────────────────────────┐
+│   Trading Cycle           │       │   Trigger Executor      │
+│   (hourly, sync thread)   │       │   (async queue drain)   │
+└─────────┬────────────────┘       └──────────┬─────────────┘
+          │ reads                              │ executes SELL
+          │                                   │ consumes trigger_queue
+┌─────────▼───────────────────────────────────────────────────┐
+│                  Market State Store                          │
+│          in-memory dict[str, SymbolMarketState]              │
+└─────────▲───────────────────────────────────────────────────┘
+          │ writes on every tick
+┌─────────┴───────────────────────────────────────────────────┐
+│              BinanceWebSocketService                         │
+│   wss://data-stream.binance.vision/stream?streams=...@ticker │
+└─────────────────────────────────────────────────────────────┘
+          │ calls check_exit_conditions() on every tick
+┌─────────▼───────────────────────────────────────────────────┐
+│                    Risk Service                              │
+│       in-memory position tracking + rule enforcement         │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Components
 
-### MarketStateStore
+### `app/main.py` — Application bootstrap
 
-An in-memory dictionary keyed by symbol (`BTCUSDT`, `ETHUSDT`, `SOLUSDT`). Each entry is a `SymbolMarketState` dataclass holding the latest price, bid, ask, 24h high/low, volume, and timestamp. Updated on every WebSocket tick.
+All service instances are created at **module level** (singletons for the process lifetime). The FastAPI `lifespan` context manager handles startup and shutdown:
 
-This is the single source of truth for live prices. It is read by the trading cycle to build market snapshots without making any HTTP calls.
+```python
+# Startup sequence (inside lifespan):
+init_db()                                    # 1. Create SQLite tables
+asyncio.create_task(ws_service.run_forever()) # 2. Start WebSocket stream
+asyncio.create_task(trigger_executor.run_forever()) # 3. Start exit processor
+scheduler.add_job(run_hourly_cycle, ...)     # 4. Schedule hourly cycle
+scheduler.start()                            # 5. Fire first cycle immediately
+```
 
-### BinanceWebSocketService
+Service wiring is explicit constructor injection — each service receives its dependencies at creation time:
 
-Connects to Binance's combined `@ticker` stream, which pushes a full 24h statistics payload for each tracked symbol roughly every second. On each message it updates `MarketStateStore` and then checks whether any open position has hit its stop-loss or take-profit threshold.
+```python
+market_store      = MarketStateStore()
+risk_service      = RiskService()
+execution_service = ExecutionService(risk_service=risk_service)
+trading_cycle     = TradingCycleService(market_store, risk_service, execution_service)
+ws_service        = BinanceWebSocketService(symbols, market_store, risk_service, trigger_queue)
+trigger_executor  = TriggerExecutor(trigger_queue, execution_service)
+```
 
-### RiskService
+---
 
-Holds all open positions in a `dict[str, OpenPosition]` in memory. Every decision — whether from the hourly AI cycle or from a real-time WebSocket trigger — passes through this service before execution. It enforces all risk rules: kill switch, confidence threshold, position sizing, exposure cap, entry guards, and exit guards.
+### `MarketStateStore` — In-memory price cache
 
-### TriggerExecutor
+A `dict[str, SymbolMarketState]` wrapped in a class. Holds the most recent 24h ticker fields for every tracked symbol:
 
-A background `asyncio` task that waits on a queue. When `RiskService.check_exit_conditions()` detects a breach during a WebSocket tick, it puts a SELL order on the queue. `TriggerExecutor` picks it up and runs `ExecutionService.execute_decision()` in a thread pool, keeping the WebSocket loop unblocked.
+| Field | Type | Source |
+|---|---|---|
+| `last_price` | `Decimal` | `c` (close/last) field in `@ticker` |
+| `bid` | `Decimal` | `b` field |
+| `ask` | `Decimal` | `a` field |
+| `volume_24h` | `Decimal` | `q` (quote asset volume) field |
+| `price_change_24h_pct` | `Decimal` | `P` field |
+| `high_24h` | `Decimal` | `h` field |
+| `low_24h` | `Decimal` | `l` field |
+| `updated_at` | `datetime` | Set at update time |
 
-### TradingCycleService
+The store has no locking. CPython's GIL serializes dict reads/writes, which is sufficient here because the WebSocket callback is synchronous (`_handle_message` is called within the async loop but is not itself `async`).
 
-The hourly orchestrator. Reads from `MarketStateStore`, fetches sentiment, calls Claude, applies risk filters, executes decisions, and writes every step to SQLite. It does not run on a fixed clock — it runs immediately on startup and then every 60 minutes from that point.
+---
 
-### ExecutionService
+### `BinanceWebSocketService` — Real-time price ingestion
 
-Handles the mechanics of placing an order. In paper mode it constructs a synthetic order dict and logs it. In live mode it calls `ccxt.binance.create_market_order()`. In both cases it updates `RiskService`'s position state and appends a record to `logs/trades.jsonl`.
+Connects to the Binance combined stream endpoint:
+```
+wss://data-stream.binance.vision/stream?streams=btcusdt@ticker/ethusdt@ticker/solusdt@ticker
+```
 
-### AI Service
+The URL is built from `settings.tracked_symbols` at construction time. Each message is a combined-stream envelope:
+```json
+{ "stream": "btcusdt@ticker", "data": { "s": "BTCUSDT", "c": "67423.01", ... } }
+```
 
-A stateless module that constructs a prompt from market and sentiment data, calls the Claude API, extracts the JSON array from the response, validates each decision against the schema, and returns a list of `{asset, action, confidence, size_pct, reasoning}` dicts. It maintains a module-level singleton `anthropic.Anthropic` client.
+For each message:
+1. Parse JSON, extract `data` sub-object
+2. Update `MarketStateStore` with parsed `Decimal` values
+3. Call `risk_service.check_exit_conditions(symbol, last_price)`
+4. If an exit is triggered (stop-loss or take-profit), push the SELL order onto `trigger_queue`
 
-### Sentiment Service
+The `run_forever()` method wraps the WebSocket connection in `while True` with a 5-second reconnect delay on any exception.
 
-Fetches text from crypto RSS feeds and Reddit, runs TextBlob polarity analysis on headlines that match each symbol's keywords, and blends the scores with the Fear & Greed index into a single float in `[-1, 1]`.
+---
 
-### Data Feeds
+### `TriggerExecutor` — Real-time exit processor
 
-A thin ccxt wrapper that provides balance fetching and OHLCV data. In paper mode, balance is a configured constant. The exchange object is a lazy singleton — created on first use and reused.
+Drains `trigger_queue` in an async loop. Each dequeued order is dispatched to the default thread pool executor via `loop.run_in_executor(None, self._execute, order)`. This keeps the WebSocket message loop unblocked even if the execution involves a synchronous HTTP call (ccxt in live mode).
+
+The `_execute` method:
+1. Retrieves the current balance (paper stub or ccxt)
+2. Builds a single-asset `market_data` dict using `trigger_price` as `last_price`
+3. Calls `execution_service.execute_decision(order, market_data, balance)`
+4. Logs the result at `WARNING` level
+
+---
+
+### `TradingCycleService` — Hourly orchestrator
+
+The synchronous `run(db: Session)` method is called by APScheduler from a thread pool worker. It is **not** an async function — APScheduler's `AsyncIOScheduler` runs jobs via `asyncio.get_event_loop().run_in_executor()` by default for sync callables.
+
+Steps in `run()`:
+1. Call `_build_market_data()` to convert `MarketStateStore` state to the market-data dict
+2. If no data (WebSocket not ready), log and return early
+3. Call `_fetch_sentiment(symbols)` — wraps `get_all_sentiment()` with exception isolation
+4. Call `_fetch_decisions(market_data, sentiment_data, symbols)` — wraps `get_trading_decisions()` with HOLD fallback
+5. Call `risk_service.filter_decisions(decisions, market_data)`
+6. Call `_fetch_balance()` — paper stub or ccxt
+7. For each filtered decision, call `_persist_cycle(db, ...)` inside a try/except that rolls back on integrity errors
+
+---
+
+### `AIService` — Claude decision engine
+
+Stateless module-level functions. Uses a lazy-initialized `anthropic.Anthropic` singleton client (created on first call to `_get_client()`).
+
+The system prompt constrains Claude to return **only** a JSON array with a fixed schema. The user prompt is a plaintext block with one section per symbol containing price, 24h range, volume, sentiment score, Fear & Greed Index, and up to 3 top headlines.
+
+Response processing:
+1. Strip markdown fences (```` ``` ````) if present
+2. Extract the JSON array using a regex (`\[.*\]` with `DOTALL`)
+3. Parse with `json.loads()`
+4. Validate each item against the required field set
+5. Enforce confidence threshold and size caps
+6. Fill in `HOLD` defaults for any symbols missing from the response
+
+---
+
+### `RiskService` — Risk enforcement
+
+Maintains `_positions: dict[str, OpenPosition]` in memory. Each `OpenPosition` holds `asset`, `entry_price`, `size_pct`, and `current_price`.
+
+Risk checks are performed in two contexts:
+- **Hourly cycle**: `filter_decisions()` calls `check_stop_losses()` for existing positions, then `evaluate_decision()` for each AI decision
+- **Real-time (every tick)**: `check_exit_conditions()` is called directly by the WebSocket handler
+
+When a stop-loss or take-profit triggers in `check_exit_conditions()`, the position is **deleted immediately** from `_positions` before returning the SELL order. This prevents re-triggering on the next tick while the order is still in the queue.
+
+The kill switch is implemented as `os.getenv("KILL_SWITCH", "false").lower() == "true"` evaluated at call time. No restart needed to activate it.
+
+---
+
+### `ExecutionService` — Order placement
+
+Handles both paper and live execution paths.
+
+**Paper mode** (`PAPER_TRADING=true`):
+- Computes `qty = portfolio_usdt * (size_pct / 100) / price`
+- Builds a synthetic order dict with `id = "PAPER-{timestamp}"`
+- Updates `RiskService` position tracking
+- Logs to `logs/trades.jsonl`
+
+**Live mode** (`PAPER_TRADING=false`):
+- Converts symbol: `BTCUSDT` → `BTC/USDT`
+- Calls `get_exchange().create_market_order(symbol, side, qty)`
+- Uses `order["average"]` as the filled price for position tracking
+- Logs the raw ccxt order response to `logs/trades.jsonl`
+
+In both modes, all records (including HOLDs) are appended to `logs/trades.jsonl` as newline-delimited JSON.
+
+---
+
+### `SentimentService` — Market sentiment
+
+Three data sources, all producing scores in `[-1.0, 1.0]`:
+
+| Source | Method | Weighting |
+|---|---|---|
+| RSS headlines | TextBlob polarity on `title + summary` for matching entries | Simple mean |
+| Reddit posts | Upvote-weighted TextBlob polarity on post titles | Upvote-weighted mean |
+| Fear & Greed Index | `(value - 50) / 50.0` | Equal weight with others |
+
+Final score = simple mean of the three source scores, clamped to `[-1, 1]`.
+
+The Fear & Greed Index is fetched once per cycle and shared across all symbols (it is a global market indicator, not asset-specific). RSS and Reddit are fetched per-asset using keyword matching (`BTCUSDT` → `["bitcoin", "btc"]`).
+
+---
+
+### `DataFeeds` — ccxt market data
+
+Module-level lazy singleton `ccxt.binance` exchange instance. Created on first call to `get_exchange()`.
+
+In paper trading mode (no `BINANCE_API_KEY`), `fetch_balance()` returns a static dict using `PAPER_BALANCE_USDT` from settings. This means `get_exchange()` is still constructed (for public market data access) but without API credentials.
+
+`get_all_market_data()` is marked as a fallback in comments — the primary price source is the WebSocket, not ccxt REST. ccxt REST is only used for `fetch_balance()` in live mode.
 
 ---
 
@@ -107,32 +231,28 @@ A thin ccxt wrapper that provides balance fetching and OHLCV data. In paper mode
 
 ```
 main.py
-  ├── MarketStateStore
-  ├── RiskService
-  ├── ExecutionService ──────────── depends on: RiskService
-  ├── TradingCycleService ──────── depends on: MarketStateStore, RiskService, ExecutionService
-  ├── BinanceWebSocketService ──── depends on: MarketStateStore, RiskService, trigger_queue
-  └── TriggerExecutor ──────────── depends on: trigger_queue, ExecutionService
-```
+  ├── MarketStateStore          (no deps)
+  ├── RiskService               (reads settings directly)
+  ├── ExecutionService          ← RiskService
+  ├── TradingCycleService       ← MarketStateStore, RiskService, ExecutionService
+  ├── BinanceWebSocketService   ← MarketStateStore, RiskService, trigger_queue
+  └── TriggerExecutor           ← trigger_queue, ExecutionService
 
-All dependencies are injected at startup in `main.py`. No service creates its own dependencies. This makes each service independently testable.
+TradingCycleService.run()
+  ├── ai_service.get_trading_decisions()     (← anthropic SDK, settings)
+  ├── sentiment_service.get_all_sentiment()  (← feedparser, requests, TextBlob)
+  ├── data_feeds.fetch_balance()             (← ccxt or paper stub)
+  └── SQLAlchemy Session                     (← SQLite file)
+```
 
 ---
 
-## Design Decisions
+## Design Rationale
 
-### Why class-based services?
+**Single process, single event loop** — deployment is one `uvicorn` command, no message queue, no worker processes. Blocking calls in the hourly cycle run in APScheduler's thread pool and do not block the WebSocket loop.
 
-`RiskService` and `ExecutionService` hold state (`_positions`, the trade log path). Classes make that state explicit and scoped to an instance rather than leaked as module globals. `TradingCycleService` holds no state itself — it's a class because it composes three injected dependencies.
+**In-memory position tracking** — eliminates DB round-trips on every WebSocket tick. The tradeoff is position state is lost on restart. See [persistence.md](persistence.md).
 
-### Why asyncio.Queue for exits?
+**Kill switch as env var read at call time** — lets an operator halt trading without restarting the process. Set `KILL_SWITCH=true` in the environment and it takes effect on the next risk check.
 
-The WebSocket handler (`_handle_message`) is called synchronously inside an async loop. `ExecutionService.execute_decision()` is blocking — it may call ccxt (HTTP), write files, and talk to SQLite. If we called it directly in `_handle_message`, we would block the entire WebSocket loop, potentially missing subsequent price ticks. The queue decouples detection from execution.
-
-### Why IntervalTrigger instead of CronTrigger?
-
-`CronTrigger(minute=0)` would wait until the next clock hour. `IntervalTrigger(hours=1, next_run_time=now)` fires immediately and then every 60 minutes from that point. This means if you restart the bot at 14:35, the first cycle runs at 14:35, not 15:00.
-
-### Why SQLite?
-
-This is a prototype. SQLite requires zero infrastructure. The SQLAlchemy ORM is written against the standard interface so switching to PostgreSQL is a one-line change to `DATABASE_URL`.
+**Constructor injection** — makes the service graph explicit and unit-testable without mocking module globals.
