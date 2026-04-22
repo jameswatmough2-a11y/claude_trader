@@ -15,7 +15,7 @@ from app.services.risk_service import RiskService
 from app.services.execution_service import ExecutionService
 from app.services.ai_service import get_trading_decisions
 from app.services.sentiment_service import get_all_sentiment
-from app.services.data_feeds import fetch_balance
+from app.services.data_feeds import fetch_balance, fetch_ohlcv
 
 logger = logging.getLogger(__name__)
 
@@ -45,16 +45,16 @@ class TradingCycleService:
         symbols = list(market_data.keys())
         logger.info("Processing %d symbols: %s", len(symbols), symbols)
 
+        self._enrich_with_ohlcv(market_data)
         sentiment_data = self._fetch_sentiment(symbols)
         decisions = self._fetch_decisions(market_data, sentiment_data, symbols)
         filtered = self.risk_service.filter_decisions(decisions, market_data)
-        balance = self._fetch_balance()
 
         for decision in filtered:
             symbol = decision["asset"]
             md = market_data.get(symbol, {})
             try:
-                self._persist_cycle(db, symbol, md, decision, balance, now)
+                self._persist_cycle(db, symbol, md, decision, now)
             except IntegrityError:
                 db.rollback()
                 logger.warning("Duplicate snapshot for %s at %s — skipping", symbol, now.isoformat())
@@ -89,10 +89,44 @@ class TradingCycleService:
                     "low_24h": float(state.low_24h or state.last_price),
                     "avg_volume_24h": float(state.volume_24h or 0),
                     "price_change_pct_24h": float(state.price_change_24h_pct or 0),
+                    "candles": [],
                 },
                 "orderbook": {},
             }
         return result
+
+    def _enrich_with_ohlcv(self, market_data: dict[str, Any]) -> None:
+        """Fetch real 24-hourly candles from Binance and merge into market_data."""
+        for symbol in list(market_data.keys()):
+            try:
+                df = fetch_ohlcv(symbol, timeframe="1h", limit=24)
+                if df.empty:
+                    continue
+                candles = [
+                    {
+                        "time": str(ts),
+                        "open": float(row["open"]),
+                        "high": float(row["high"]),
+                        "low": float(row["low"]),
+                        "close": float(row["close"]),
+                        "volume": float(row["volume"]),
+                    }
+                    for ts, row in df.iterrows()
+                ]
+                market_data[symbol]["ohlcv"] = {
+                    "last_close": float(df["close"].iloc[-1]),
+                    "high_24h": float(df["high"].max()),
+                    "low_24h": float(df["low"].min()),
+                    "avg_volume_24h": float(df["volume"].mean()),
+                    "price_change_pct_24h": round(
+                        (df["close"].iloc[-1] - df["close"].iloc[0]) / df["close"].iloc[0] * 100,
+                        2,
+                    ),
+                    "candles": candles,
+                }
+                logger.info("OHLCV enriched for %s (%d candles)", symbol, len(candles))
+            except Exception:
+                logger.warning("OHLCV fetch failed for %s — using WebSocket ticker data", symbol)
 
     def _fetch_sentiment(self, symbols: list[str]) -> dict[str, Any]:
         try:
@@ -123,11 +157,20 @@ class TradingCycleService:
             ]
 
     def _fetch_balance(self) -> dict[str, Any]:
+        if settings.paper_trading:
+            bal = self.execution_service.paper_usdt
+            return {"USDT": {"free": bal, "used": 0.0, "total": bal}}
         try:
             return fetch_balance()
         except Exception:
             logger.exception("Balance fetch failed — using configured paper balance")
-            return {"USDT": {"free": settings.paper_balance_usdt, "used": 0.0, "total": settings.paper_balance_usdt}}
+            return {
+                "USDT": {
+                    "free": settings.paper_balance_usdt,
+                    "used": 0.0,
+                    "total": settings.paper_balance_usdt,
+                }
+            }
 
     def _persist_cycle(
         self,
@@ -135,9 +178,9 @@ class TradingCycleService:
         symbol: str,
         md: dict[str, Any],
         decision: dict[str, Any],
-        balance: dict[str, Any],
         now: datetime,
     ) -> None:
+        balance = self._fetch_balance()
         asset = self._get_or_create_asset(db, symbol)
 
         price = Decimal(str(md.get("last_price", 0) or 0))
@@ -169,6 +212,19 @@ class TradingCycleService:
         db.flush()
 
         exec_result = self.execution_service.execute_decision(decision, {symbol: md}, balance)
+
+        # Update position to reflect actual post-execution state from risk service
+        pos = self.risk_service.get_open_positions().get(symbol)
+        if pos is not None:
+            position.side = "long"
+            position.size = Decimal(str(round(pos.size_pct, 4)))
+            position.entry_price = Decimal(str(pos.entry_price))
+            if pos.current_price > 0 and pos.entry_price > 0:
+                unrealized_pct = (pos.current_price - pos.entry_price) / pos.entry_price * 100
+                position.unrealized_pnl = Decimal(str(round(unrealized_pct, 4)))
+        # Update wallet balance to post-execution value
+        post_balance = self._fetch_balance()
+        position.wallet_balance = Decimal(str(post_balance.get("USDT", {}).get("total", 0)))
 
         ai_rec = AIDecision(
             snapshot_id=snapshot.id,

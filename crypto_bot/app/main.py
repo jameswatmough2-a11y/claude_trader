@@ -55,10 +55,10 @@ trigger_executor = TriggerExecutor(
 scheduler = AsyncIOScheduler(timezone="UTC")
 
 
-def run_hourly_cycle() -> None:
+async def run_hourly_cycle() -> None:
     db = SessionLocal()
     try:
-        trading_cycle_service.run(db)
+        await asyncio.to_thread(trading_cycle_service.run, db)
     except Exception:
         logger.exception("Unhandled error in hourly trading cycle")
     finally:
@@ -68,6 +68,14 @@ def run_hourly_cycle() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     init_db()
+
+    # Restore positions and paper balance from DB so state survives restarts
+    db = SessionLocal()
+    try:
+        risk_service.restore_from_db(db)
+        execution_service.restore_paper_balance_from_db(db)
+    finally:
+        db.close()
 
     # Start WebSocket price stream
     asyncio.create_task(ws_service.run_forever())

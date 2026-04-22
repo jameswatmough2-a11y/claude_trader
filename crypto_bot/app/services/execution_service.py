@@ -4,13 +4,16 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import ccxt
 
 from app.config import settings
 from app.services.data_feeds import get_exchange
 from app.services.risk_service import RiskService
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +25,34 @@ class ExecutionService:
 
     def __init__(self, risk_service: RiskService) -> None:
         self.risk_service = risk_service
+        self._paper_usdt: float = settings.paper_balance_usdt
         TRADE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def paper_usdt(self) -> float:
+        return self._paper_usdt
+
+    def restore_paper_balance_from_db(self, db: "Session") -> None:
+        """Compute paper USDT balance by replaying all filled executions from DB."""
+        from app.models.execution import Execution
+
+        balance = settings.paper_balance_usdt
+        executions = (
+            db.query(Execution)
+            .filter(Execution.status.in_(["filled", "paper_filled"]))
+            .all()
+        )
+        for ex in executions:
+            size = float(ex.executed_size or 0)
+            price = float(ex.execution_price or 0)
+            cost = size * price
+            if ex.executed_action == "BUY":
+                balance -= cost
+            elif ex.executed_action == "SELL":
+                balance += cost
+
+        self._paper_usdt = max(0.0, balance)
+        logger.info("Paper balance restored from DB: %.2f USDT", self._paper_usdt)
 
     def execute_decision(
         self,
@@ -92,6 +122,12 @@ class ExecutionService:
                 "price": price,
                 "status": "paper_filled",
             }
+            cost = qty * price
+            if action == "BUY":
+                self._paper_usdt -= cost
+            elif action == "SELL":
+                self._paper_usdt += cost
+            logger.info("Paper balance after %s %s: %.2f USDT", action, asset, self._paper_usdt)
             self._update_positions(asset, action, price, record["size_pct"])
         except ValueError as exc:
             record["error"] = str(exc)

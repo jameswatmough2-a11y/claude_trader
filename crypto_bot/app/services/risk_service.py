@@ -3,9 +3,12 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.config import settings
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +56,36 @@ class RiskService:
 
     def get_open_positions(self) -> dict[str, OpenPosition]:
         return dict(self._positions)
+
+    def restore_from_db(self, db: "Session") -> None:
+        """Reconstruct in-memory positions from the last filled BUY/SELL per asset."""
+        from sqlalchemy import desc
+        from app.models.asset import Asset
+        from app.models.execution import Execution
+        from app.models.ai_decision import AIDecision
+        from app.models.hourly_market_snapshot import HourlyMarketSnapshot
+
+        assets = db.query(Asset).all()
+        for asset in assets:
+            latest = (
+                db.query(Execution)
+                .join(AIDecision, Execution.ai_decision_id == AIDecision.id)
+                .join(HourlyMarketSnapshot, AIDecision.snapshot_id == HourlyMarketSnapshot.id)
+                .filter(HourlyMarketSnapshot.asset_id == asset.id)
+                .filter(Execution.executed_action.in_(["BUY", "SELL"]))
+                .filter(Execution.status.in_(["filled", "paper_filled"]))
+                .order_by(desc(Execution.execution_time))
+                .first()
+            )
+            if latest and latest.executed_action == "BUY":
+                size_pct = float(latest.ai_decision.recommended_size or 0)
+                entry_price = float(latest.execution_price or 0)
+                if entry_price > 0 and size_pct > 0:
+                    self.record_open_position(asset.symbol, entry_price, size_pct)
+                    logger.info(
+                        "Restored position: %s @ %.4f (%.1f%%)",
+                        asset.symbol, entry_price, size_pct,
+                    )
 
     def get_total_exposure_pct(self) -> float:
         return sum(p.size_pct for p in self._positions.values())

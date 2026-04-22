@@ -69,16 +69,11 @@ def _rss_sentiment(keywords: list[str]) -> tuple[float, list[str]]:
 
     for url in RSS_FEEDS:
         try:
-<<<<<<< HEAD:crypto_bot/app/services/sentiment_service.py
-            feed = feedparser.parse(url)
-            if feed.bozo and not feed.entries:
-=======
             resp = requests.get(url, headers=RSS_HEADERS, timeout=10)
             resp.raise_for_status()
             feed = feedparser.parse(resp.content)
             if not feed.entries:
                 logger.warning("RSS: no entries from %s", url)
->>>>>>> 7896932fe482d2b7afbdf1756b2930aa8c37351a:crypto_bot/sentiment.py
                 continue
             for entry in feed.entries[:40]:
                 title = entry.get("title", "")

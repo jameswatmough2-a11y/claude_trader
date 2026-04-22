@@ -78,6 +78,11 @@ def _build_prompt(market_data: dict[str, Any], sentiment_data: dict[str, Any]) -
                 f"Quote Volume: ${float(md.get('quote_volume_24h', 0) or 0):,.0f}"
             )
 
+        candles = ohlcv.get("candles", [])
+        if candles:
+            recent_closes = " → ".join(f"${c['close']:,.2f}" for c in candles[-6:])
+            lines.append(f"Last 6h closes: {recent_closes}")
+
         sent = sentiment_data.get(symbol)
         if sent:
             fg = f" | Fear & Greed: {sent.fear_greed_index}/100" if sent.fear_greed_index is not None else ""

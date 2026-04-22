@@ -49,10 +49,13 @@ class TriggerExecutor:
         )
 
     def _get_balance(self) -> dict[str, Any]:
+        if settings.paper_trading:
+            bal = self.execution_service.paper_usdt
+            return {"USDT": {"free": bal, "used": 0.0, "total": bal}}
         try:
             from app.services.data_feeds import fetch_balance
             return fetch_balance()
         except Exception:
             logger.warning("TriggerExecutor: balance fetch failed — using paper balance")
-            bal = settings.paper_balance_usdt
+            bal = self.execution_service.paper_usdt
             return {"USDT": {"free": bal, "used": 0.0, "total": bal}}
