@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from sqlalchemy import ForeignKey, Integer, Numeric, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from . import HourlyMarketSnapshot, Asset
-
 from .base import Base
 
+if TYPE_CHECKING:
+    from .hourly_market_snapshot import HourlyMarketSnapshot
+    from .asset import Asset
 
 
 class Position(Base):

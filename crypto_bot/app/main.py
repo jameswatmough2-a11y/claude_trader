@@ -1,0 +1,84 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
+
+from fastapi import FastAPI
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+from app.api.routes.health import router as health_router
+from app.api.routes.assets import router as assets_router
+from app.api.routes.positions import router as positions_router
+from app.api.routes.decisions import router as decisions_router
+from app.config import settings
+from app.db.init_db import init_db
+from app.db.session import SessionLocal
+from app.services.binance_ws import BinanceWebSocketService
+from app.services.market_state import MarketStateStore
+from app.services.risk_service import RiskService
+from app.services.execution_service import ExecutionService
+from app.services.trading_cycle import TradingCycleService
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+# ── Service wiring ─────────────────────────────────────────────────────────────
+market_store = MarketStateStore()
+risk_service = RiskService()
+execution_service = ExecutionService(risk_service=risk_service)
+trading_cycle_service = TradingCycleService(
+    market_store=market_store,
+    risk_service=risk_service,
+    execution_service=execution_service,
+)
+ws_service = BinanceWebSocketService(
+    symbols=settings.tracked_symbols,
+    market_store=market_store,
+)
+scheduler = AsyncIOScheduler(timezone="UTC")
+
+
+def run_hourly_cycle() -> None:
+    db = SessionLocal()
+    try:
+        trading_cycle_service.run(db)
+    except Exception:
+        logger.exception("Unhandled error in hourly trading cycle")
+    finally:
+        db.close()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    init_db()
+    asyncio.create_task(ws_service.run_forever())
+    scheduler.add_job(
+        run_hourly_cycle,
+        trigger=CronTrigger(minute=0),
+        id="hourly_trading_cycle",
+        replace_existing=True,
+    )
+    scheduler.start()
+    logger.info(
+        "Bot started — paper_trading=%s symbols=%s",
+        settings.paper_trading,
+        settings.tracked_symbols,
+    )
+    yield
+    scheduler.shutdown(wait=False)
+    logger.info("Bot stopped")
+
+
+app = FastAPI(title="Claude Trader", lifespan=lifespan)
+
+app.include_router(health_router)
+app.include_router(assets_router)
+app.include_router(positions_router)
+app.include_router(decisions_router)

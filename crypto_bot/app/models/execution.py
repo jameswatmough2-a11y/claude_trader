@@ -2,15 +2,15 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from sqlalchemy import DateTime, ForeignKey, Integer, Numeric, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from . import AIDecision
-
 from .base import Base
 
+if TYPE_CHECKING:
+    from .ai_decision import AIDecision
 
 
 class Execution(Base):

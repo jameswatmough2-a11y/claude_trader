@@ -2,15 +2,17 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from sqlalchemy import DateTime, ForeignKey, Index, Integer, Numeric, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from . import Asset, Position, AIDecision
-
 from .base import Base
 
+if TYPE_CHECKING:
+    from .asset import Asset
+    from .position import Position
+    from .ai_decision import AIDecision
 
 
 class HourlyMarketSnapshot(Base):
