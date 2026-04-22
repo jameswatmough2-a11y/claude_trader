@@ -17,11 +17,20 @@ ASSET_KEYWORDS: dict[str, list[str]] = {
 }
 
 RSS_FEEDS = [
-    "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "https://cointelegraph.com/rss",
     "https://decrypt.co/feed",
     "https://bitcoinmagazine.com/feed",
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
 ]
+
+RSS_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/rss+xml, application/xml, text/xml, */*",
+}
 
 REDDIT_SUBS = ["cryptocurrency", "bitcoin", "ethtrader"]
 REDDIT_HEADERS = {"User-Agent": "crypto_sentiment_bot/1.0"}
@@ -60,8 +69,16 @@ def _rss_sentiment(keywords: list[str]) -> tuple[float, list[str]]:
 
     for url in RSS_FEEDS:
         try:
+<<<<<<< HEAD:crypto_bot/app/services/sentiment_service.py
             feed = feedparser.parse(url)
             if feed.bozo and not feed.entries:
+=======
+            resp = requests.get(url, headers=RSS_HEADERS, timeout=10)
+            resp.raise_for_status()
+            feed = feedparser.parse(resp.content)
+            if not feed.entries:
+                logger.warning("RSS: no entries from %s", url)
+>>>>>>> 7896932fe482d2b7afbdf1756b2930aa8c37351a:crypto_bot/sentiment.py
                 continue
             for entry in feed.entries[:40]:
                 title = entry.get("title", "")
