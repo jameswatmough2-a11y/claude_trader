@@ -45,6 +45,10 @@ class ConfigPayload(BaseModel):
     take_profit_pct: float = Field(ge=0.0, le=100.0)
     tracked_symbols: str = Field(default="BTCUSDT,ETHUSDT,SOLUSDT")
     paper_balance_usdt: float = Field(ge=100.0, le=10_000_000.0)
+    chart_interval: str = Field(default="1m")
+    model_name: str = Field(default="claude-sonnet-4-6")
+    timezone: str = Field(default="UTC")
+    display_currency: str = Field(default="USD")
 
 
 @router.get("/config")
@@ -71,6 +75,10 @@ async def put_config(payload: ConfigPayload, db: Session = Depends(get_db)) -> d
     row.take_profit_pct = payload.take_profit_pct
     row.tracked_symbols = _normalise_symbols(payload.tracked_symbols)
     row.paper_balance_usdt = payload.paper_balance_usdt
+    row.chart_interval = payload.chart_interval
+    row.model_name = payload.model_name.strip()
+    row.timezone = payload.timezone.strip() or "UTC"
+    row.display_currency = payload.display_currency.strip().upper() or "USD"
     row.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(row)
@@ -167,6 +175,7 @@ def _apply_settings(row: BotConfig) -> None:
     settings.stop_loss_pct = row.stop_loss_pct
     settings.take_profit_pct = row.take_profit_pct
     settings.paper_balance_usdt = row.paper_balance_usdt
+    settings.model_name = row.model_name
     if row.tracked_symbols:
         settings.tracked_symbols = [s.strip().upper() for s in row.tracked_symbols.split(",") if s.strip()]
 

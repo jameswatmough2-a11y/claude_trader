@@ -4,57 +4,23 @@ This document is an honest accounting of what would break, degrade, or behave in
 
 ---
 
-## 1. Position State Is Lost on Restart
+## 1. ~~Position State Is Lost on Restart~~ — Resolved
 
-**What happens:** `RiskService._positions` is an in-memory dict. When the process restarts, all knowledge of open positions is gone.
+Position state is now persisted to the database and restored on startup via `RiskService.restore_from_db(db)`. The method queries the latest filled BUY/SELL execution per asset and reconstructs `_positions` before the first trading cycle runs.
 
-**Consequences:**
-- Stop-loss and take-profit checks no longer fire for positions that were open before the restart
-- The double-entry guard (`BUY blocked if already holding`) does not fire — the bot may BUY into an asset it already holds
-- The phantom-sell guard (`SELL blocked if no position`) fires correctly for post-restart sells, but any position opened before the restart cannot be sold by the AI
-
-**Example failure scenario:**
-- Bot opens BTC position at $67,000
-- Process restarts
-- BTC drops to $50,000 (below stop-loss)
-- Bot has no knowledge of the BTC position
-- No stop-loss fires
-- Claude recommends SELL at $50,000; risk service blocks it (phantom-sell guard)
-- Loss accumulates indefinitely
-
-**Fix:** Load open positions from the database on startup. Requires storing actual position state (entry price, size) in the `positions` table, and implementing a startup recovery pass in `RiskService.__init__`.
+Stop-loss and take-profit checks resume immediately after restart for any position that was correctly executed and recorded.
 
 ---
 
-## 2. DB Position Records Do Not Reflect Actual Positions
+## 2. ~~DB Position Records Do Not Reflect Actual Positions~~ — Resolved
 
-**What happens:** `_persist_cycle` always writes `side="flat", size=0, entry_price=None` to the `positions` table. The table stores wallet balance history, not open position state.
-
-**Consequences:**
-- `GET /positions` returns no useful position data
-- There is no way to reconstruct position state from the database after a crash
-- The DB is not usable as a source of truth for risk calculations
-
-**Fix:** After executing a BUY, write `side="long", size=qty, entry_price=price` to the position record. Read these values on startup to recover `RiskService._positions`.
+Position records now store the actual post-execution state: `side`, `size_pct`, `entry_price`, and `unrealized_pnl` are written after each BUY/SELL. `GET /positions` returns meaningful data and the database is used as the recovery source on startup.
 
 ---
 
-## 3. Paper Balance Is Not Stateful
+## 3. ~~Paper Balance Is Not Stateful~~ — Resolved
 
-**What happens:** `fetch_balance()` always returns `{"USDT": {"free": PAPER_BALANCE_USDT, "total": PAPER_BALANCE_USDT}}`. The balance never decreases.
-
-**Consequences:**
-- Trade size calculations are based on the full configured paper balance every cycle
-- If multiple positions are open, each is sized as if no other positions exist
-- Simulated portfolio performance is inaccurate — the bot effectively "prints money"
-
-**Example:** With `PAPER_BALANCE_USDT=10000` and `MAX_POSITION_PCT=20`:
-- Cycle 1: BUY BTC, $2,000 (20% of $10,000)
-- Cycle 2: BUY ETH, $2,000 (20% of $10,000) — but balance should be $8,000 now
-- Effective exposure: $4,000 of a $10,000 portfolio = 40%, correct
-- But trade sizes are computed as 20% of $10,000 each time, not 20% of remaining balance
-
-**Fix:** Implement a virtual paper balance that tracks executed trades and reduces the available USDT on BUY, increases it on SELL. This could be maintained in-memory alongside `_positions`.
+The paper USDT balance is now tracked in memory and restored on startup. `ExecutionService.restore_paper_balance_from_db(db)` replays all historical filled executions to compute the correct current balance. BUY executions reduce the balance; SELL executions increase it. The balance no longer resets to `PAPER_BALANCE_USDT` on every restart.
 
 ---
 

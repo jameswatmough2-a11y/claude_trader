@@ -52,6 +52,7 @@ def _build_prompt(
     market_data: dict[str, Any],
     sentiment_data: dict[str, Any],
     open_positions: dict[str, Any] | None = None,
+    previous_decisions: dict[str, Any] | None = None,
 ) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines: list[str] = [
@@ -77,6 +78,24 @@ def _build_prompt(
                 )
             else:
                 lines.append(f"  {symbol}: flat — no position")
+    lines.append("")
+
+    # Previous decision context — helps Claude reason about continuing vs reversing
+    symbols = list(market_data.keys()) or settings.tracked_symbols
+    lines.append("=== PREVIOUS DECISIONS (last cycle) ===")
+    if not previous_decisions:
+        lines.append("No previous decisions recorded — this is the first cycle.")
+    else:
+        for symbol in symbols:
+            prev = previous_decisions.get(symbol.upper())
+            if prev:
+                time_str = f" at {prev['time'][:16].replace('T', ' ')}" if prev.get("time") else ""
+                lines.append(
+                    f"  {symbol}: {prev['action']} "
+                    f"(confidence {prev['confidence']:.2f}{time_str}) — \"{prev['reasoning']}\""
+                )
+            else:
+                lines.append(f"  {symbol}: no previous decision")
     lines.append("")
 
     lines.append("=== MARKET DATA ===")
@@ -192,10 +211,11 @@ def get_trading_decisions(
     market_data: dict[str, Any],
     sentiment_data: dict[str, Any],
     open_positions: dict[str, Any] | None = None,
+    previous_decisions: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     symbols = list(market_data.keys()) or settings.tracked_symbols
     client = _get_client()
-    prompt = _build_prompt(market_data, sentiment_data, open_positions)
+    prompt = _build_prompt(market_data, sentiment_data, open_positions, previous_decisions)
 
     response = client.messages.create(
         model=settings.model_name,

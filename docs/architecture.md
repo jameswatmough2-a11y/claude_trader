@@ -247,6 +247,55 @@ TradingCycleService.run()
 
 ---
 
+---
+
+## Dashboard (Next.js Frontend)
+
+The dashboard is a **Next.js 14 App Router** application in the `dashboard/` directory. It communicates with the FastAPI backend via REST (`/api/...` proxied by Next.js) and displays real-time data via a 30-second auto-refresh and WebSocket streaming for the candlestick chart.
+
+### Key components
+
+**`app/layout.tsx`** — Root layout. Wraps the entire app in `ThemeProvider` (dark/light mode) and `DisplayPrefsProvider` (global display preferences).
+
+**`app/providers/display-prefs-provider.tsx`** — React Context that exposes:
+- `prefs` — current display preferences (timezone, currency)
+- `cvtPrice(usd)` — converts a USD amount to the display currency using exchange rates
+- `currencySymbol` — the symbol for the active currency (e.g. `£`)
+- `fmtTime(iso)` — formats a UTC ISO timestamp in the user's selected timezone via `Intl`
+
+Preferences are persisted to `localStorage` and loaded on mount to avoid SSR hydration mismatches.
+
+**`app/components/dashboard.tsx`** — Main overview page. Fetches from `/api/status`, `/api/config`, `/api/decisions`, `/api/positions`, and `/api/assets`. Uses `fmtTime` and `cvtPrice` from the display prefs context for all visible timestamps and monetary values.
+
+**`app/components/candlestick-chart.tsx`** — Lightweight-charts candlestick chart with:
+- Real-time data from Binance WebSocket (via backend streaming)
+- Three price lines: Entry (yellow, dotted), Stop Loss (red, dashed), Take Profit (green, dashed)
+- Toggle buttons for each price line
+- `autoscaleInfoProvider` that expands the chart's visible range to always include SL/TP levels
+- Position info row: entry price, SL with % distance, TP with % distance, R/R ratio
+- Timezone-aware time axis via `chart.applyOptions({ localization: { timeFormatter } })`
+- Price line titles are short labels (`'Entry'`, `'SL'`, `'TP'`) — the right-axis label shows the price
+
+**`app/settings/page.tsx`** — Settings in two sections with two independent save bars:
+- **Trading Settings** — risk parameters, symbols, paper trading, model. Save is disabled while the bot is running. Shows a lock banner when locked.
+- **Display Settings** — chart interval, timezone, currency. Save is always enabled (bot running or stopped). Changes require clicking Save — they do not apply instantly.
+
+**`lib/display-prefs.ts`** — Display preference types, currency/timezone lists, exchange rates, localStorage helpers.
+
+### Display preferences system
+
+Currency and timezone are display-only — the backend always works in USD and UTC. Conversion and formatting happen entirely in the browser:
+
+```
+Backend response: { wallet_balance: 10000.0, time: "2026-04-23T01:34:00Z" }
+                           ↓ cvtPrice(10000.0)        ↓ fmtTime("2026-04-23T01:34:00Z")
+Dashboard shows:  £7,900.00                            Apr 23, 01:34
+```
+
+Exchange rates are hardcoded constants in `lib/display-prefs.ts` (no live FX feed). Timezone formatting uses the browser's `Intl` API with the IANA timezone string.
+
+---
+
 ## Design Rationale
 
 **Single process, single event loop** — deployment is one `uvicorn` command, no message queue, no worker processes. Blocking calls in the hourly cycle run in APScheduler's thread pool and do not block the WebSocket loop.

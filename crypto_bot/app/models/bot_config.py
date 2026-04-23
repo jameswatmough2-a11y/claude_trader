@@ -26,6 +26,10 @@ class BotConfig(Base):
     take_profit_pct: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     tracked_symbols: Mapped[str] = mapped_column(String, nullable=False, default="BTCUSDT,ETHUSDT,SOLUSDT")
     paper_balance_usdt: Mapped[float] = mapped_column(Float, nullable=False, default=10000.0)
+    chart_interval: Mapped[str] = mapped_column(String(10), nullable=False, default="1m")
+    model_name: Mapped[str] = mapped_column(String(100), nullable=False, default="claude-sonnet-4-6")
+    timezone: Mapped[str] = mapped_column(String(50), nullable=False, default="UTC")
+    display_currency: Mapped[str] = mapped_column(String(10), nullable=False, default="USD")
 
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
@@ -40,6 +44,10 @@ class BotConfig(Base):
             "take_profit_pct": 0.0,
             "tracked_symbols": "BTCUSDT,ETHUSDT,SOLUSDT",
             "paper_balance_usdt": 10000.0,
+            "chart_interval": "1m",
+            "model_name": "claude-sonnet-4-6",
+            "timezone": "UTC",
+            "display_currency": "USD",
         }
 
     def to_dict(self) -> dict:
@@ -52,5 +60,9 @@ class BotConfig(Base):
             "take_profit_pct": self.take_profit_pct,
             "tracked_symbols": self.tracked_symbols,
             "paper_balance_usdt": self.paper_balance_usdt,
+            "chart_interval": self.chart_interval,
+            "model_name": self.model_name,
+            "timezone": self.timezone,
+            "display_currency": self.display_currency,
             "updated_at": self.updated_at.isoformat(),
         }

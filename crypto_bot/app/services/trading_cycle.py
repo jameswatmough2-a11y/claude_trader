@@ -48,7 +48,8 @@ class TradingCycleService:
         self._enrich_with_ohlcv(market_data)
         sentiment_data = self._fetch_sentiment(symbols)
         open_positions = self.risk_service.get_open_positions()
-        decisions = self._fetch_decisions(market_data, sentiment_data, open_positions)
+        previous_decisions = self._fetch_previous_decisions(db, symbols)
+        decisions = self._fetch_decisions(market_data, sentiment_data, open_positions, previous_decisions)
         filtered = self.risk_service.filter_decisions(decisions, market_data)
 
         for decision in filtered:
@@ -137,15 +138,43 @@ class TradingCycleService:
             logger.exception("Sentiment fetch failed — proceeding without sentiment data")
             return {}
 
+    def _fetch_previous_decisions(
+        self,
+        db: Session,
+        symbols: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        from sqlalchemy import desc
+        result: dict[str, dict[str, Any]] = {}
+        for symbol in symbols:
+            asset = db.query(Asset).filter(Asset.symbol == symbol.upper()).first()
+            if asset is None:
+                continue
+            last = (
+                db.query(AIDecision)
+                .join(HourlyMarketSnapshot, AIDecision.snapshot_id == HourlyMarketSnapshot.id)
+                .filter(HourlyMarketSnapshot.asset_id == asset.id)
+                .order_by(desc(AIDecision.created_at))
+                .first()
+            )
+            if last:
+                result[symbol.upper()] = {
+                    "action": last.action,
+                    "confidence": float(last.confidence_score or 0),
+                    "reasoning": last.reasoning_summary or "",
+                    "time": last.created_at.isoformat() if last.created_at else None,
+                }
+        return result
+
     def _fetch_decisions(
         self,
         market_data: dict[str, Any],
         sentiment_data: dict[str, Any],
         open_positions: dict[str, Any],
+        previous_decisions: dict[str, Any],
     ) -> list[dict[str, Any]]:
         symbols = list(market_data.keys())
         try:
-            return get_trading_decisions(market_data, sentiment_data, open_positions)
+            return get_trading_decisions(market_data, sentiment_data, open_positions, previous_decisions)
         except Exception:
             logger.exception("AI decision call failed — defaulting all symbols to HOLD")
             return [

@@ -279,6 +279,22 @@ Changing to PostgreSQL or MySQL requires also removing the `connect_args` in `se
 
 ---
 
+---
+
+## Dashboard Settings UI
+
+Most settings can also be changed through the dashboard's **Settings page** (`/settings`) without editing `.env` directly. The page splits settings into two sections:
+
+### Trading Settings
+All risk and trading parameters (everything except `DATABASE_URL`). Saved via `PATCH /api/config`. **Disabled while the bot is running** — you must stop the bot first to edit these.
+
+### Display Settings
+Chart interval, timezone, and currency. Saved via the same `PATCH /api/config` endpoint. These can be changed at any time, even while the bot is running.
+
+The dashboard settings page reads the current config on load (`GET /api/config`) and shows a save bar when you have unsaved changes.
+
+---
+
 ## How Settings Are Loaded
 
 `app/config.py`:

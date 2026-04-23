@@ -33,6 +33,20 @@ init_db()
 ```
 Calls `Base.metadata.create_all(bind=engine)`. Creates all five SQLite tables if they do not exist. Existing data is preserved (not dropped). This is a synchronous call.
 
+**Step 1b — State restoration**
+
+Before starting the trading tasks, the bot restores persistent state from the database:
+
+```python
+risk_service.restore_from_db(db)
+execution_service.restore_paper_balance_from_db(db)
+```
+
+- `restore_from_db` queries the most recent filled execution per asset and reconstructs `RiskService._positions` with entry price, size, stop-loss price, and take-profit price.
+- `restore_paper_balance_from_db` replays all historical executions to recompute the current paper USDT balance.
+
+This ensures the bot resumes stop-loss / take-profit monitoring and correct position sizing without manual intervention after a restart.
+
 **Step 2 — WebSocket task**
 ```python
 asyncio.create_task(ws_service.run_forever())

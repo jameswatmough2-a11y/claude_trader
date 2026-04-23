@@ -17,6 +17,7 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { cn } from '@/lib/utils'
+import { useDisplayPrefs } from '@/app/providers/display-prefs-provider'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -107,11 +108,21 @@ function FilterPill({
 }
 
 function ActionBadge({ action }: { action: string }) {
-  const variant =
-    action === 'BUY' ? 'default' :
-    action === 'SELL' ? 'destructive' :
-    'secondary'
-  return <Badge variant={variant}>{action}</Badge>
+  if (action === 'BUY') return (
+    <Badge variant="outline" className="border-green-500/40 bg-green-500/10 text-green-600 dark:text-green-400">
+      BUY
+    </Badge>
+  )
+  if (action === 'SELL') return (
+    <Badge variant="outline" className="border-red-500/40 bg-red-500/10 text-red-600 dark:text-red-400">
+      SELL
+    </Badge>
+  )
+  return (
+    <Badge variant="outline" className="border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400">
+      HOLD
+    </Badge>
+  )
 }
 
 function ConfidenceCell({ value }: { value: number | null }) {
@@ -182,16 +193,10 @@ function Divider() {
   return <div className="h-3 w-px bg-border" />
 }
 
-function formatTime(iso: string) {
-  return new Date(iso).toLocaleString(undefined, {
-    month: 'short', day: 'numeric',
-    hour: '2-digit', minute: '2-digit',
-  })
-}
-
 // ── Main component ────────────────────────────────────────────────────────────
 
 export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
+  const { cvtPrice, currencySymbol, fmtTime } = useDisplayPrefs()
   const [data, setData] = useState<BotData | null>(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
@@ -282,7 +287,7 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
         <div className="flex items-center gap-3">
           {lastUpdated && (
             <span className="hidden text-xs text-muted-foreground sm:block">
-              Updated {lastUpdated.toLocaleTimeString()}
+              Updated {fmtTime(lastUpdated.toISOString())}
             </span>
           )}
           <Button variant="outline" size="sm" onClick={() => load(true)} disabled={refreshing}>
@@ -376,7 +381,7 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
         />
         <StatCard
           title="Last Cycle"
-          value={latestSnapshotTime ? formatTime(latestSnapshotTime) : null}
+          value={latestSnapshotTime ? fmtTime(latestSnapshotTime) : null}
           sub="Auto-refresh every 30s"
           icon={<RefreshCw className="size-4 text-muted-foreground" />}
           loading={loading}
@@ -393,7 +398,7 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
             <CardTitle>AI Decisions</CardTitle>
             {latestSnapshotTime && (
               <span className="text-xs text-muted-foreground">
-                Latest cycle: {formatTime(latestSnapshotTime)}
+                Latest cycle: {fmtTime(latestSnapshotTime)}
               </span>
             )}
           </div>
@@ -476,7 +481,7 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
                       <span className="line-clamp-1">{d.reasoning_summary ?? '—'}</span>
                     </TableCell>
                     <TableCell className="hidden whitespace-nowrap text-right text-xs text-muted-foreground tabular-nums sm:table-cell">
-                      {formatTime(d.snapshot_time)}
+                      {fmtTime(d.snapshot_time)}
                     </TableCell>
                   </TableRow>
                 ))
@@ -545,11 +550,11 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
                         <span className="text-muted-foreground">/USDT</span>
                       </TableCell>
                       <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
-                        {formatTime(p.snapshot_time)}
+                        {fmtTime(p.snapshot_time)}
                       </TableCell>
                       <TableCell className="text-right text-sm tabular-nums">
                         {p.wallet_balance != null
-                          ? `$${p.wallet_balance.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                          ? `${currencySymbol}${cvtPrice(p.wallet_balance).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
                           : '—'}
                       </TableCell>
                     </TableRow>

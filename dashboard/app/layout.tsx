@@ -3,6 +3,7 @@ import { Geist, Geist_Mono } from 'next/font/google'
 import './globals.css'
 import { ThemeProvider } from '@/components/theme-provider'
 import { AppSidebar } from '@/app/components/app-sidebar'
+import { DisplayPrefsProvider } from '@/app/providers/display-prefs-provider'
 import { cn } from '@/lib/utils'
 
 const geist = Geist({ subsets: ['latin'], variable: '--font-sans' })
@@ -24,17 +25,19 @@ export default function RootLayout({
     >
       <body>
         <ThemeProvider>
-          <div className="flex min-h-screen">
-            {/* Sidebar — hidden on small screens, visible md+ */}
-            <div className="hidden md:flex">
-              <AppSidebar />
-            </div>
+          <DisplayPrefsProvider>
+            <div className="flex min-h-screen">
+              {/* Sidebar — hidden on small screens, visible md+ */}
+              <div className="hidden md:flex">
+                <AppSidebar />
+              </div>
 
-            {/* Main content */}
-            <div className="flex min-h-screen flex-1 flex-col overflow-x-hidden">
-              {children}
+              {/* Main content */}
+              <div className="flex min-h-screen flex-1 flex-col overflow-x-hidden">
+                {children}
+              </div>
             </div>
-          </div>
+          </DisplayPrefsProvider>
         </ThemeProvider>
       </body>
     </html>

@@ -19,6 +19,10 @@ def _migrate_bot_config() -> None:
     new_cols = [
         ("tracked_symbols", "VARCHAR NOT NULL DEFAULT 'BTCUSDT,ETHUSDT,SOLUSDT'"),
         ("paper_balance_usdt", "FLOAT NOT NULL DEFAULT 10000.0"),
+        ("chart_interval", "VARCHAR NOT NULL DEFAULT '1m'"),
+        ("model_name", "VARCHAR NOT NULL DEFAULT 'claude-sonnet-4-6'"),
+        ("timezone", "VARCHAR NOT NULL DEFAULT 'UTC'"),
+        ("display_currency", "VARCHAR NOT NULL DEFAULT 'USD'"),
     ]
 
     with engine.connect() as conn:

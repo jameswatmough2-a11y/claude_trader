@@ -96,22 +96,19 @@ positions
 
 One `Position` record is written per snapshot (per symbol per cycle). The `snapshot_id` is unique — there is at most one position record per snapshot.
 
-**Critical limitation:** These records do not reflect actual open positions.
+**Position records reflect actual post-execution state.** After executing a BUY or SELL, `_persist_cycle` writes the real position state:
 
-`_persist_cycle` always writes:
 ```python
 position = Position(
-    side="flat",
-    size=Decimal("0"),
-    entry_price=None,
-    unrealized_pnl=None,
-    wallet_balance=wallet_usdt,  # from fetch_balance()
+    side="long" | "short" | "flat",   # reflects actual position after execution
+    size=size_pct,                     # percentage of portfolio allocated
+    entry_price=execution_price,       # fill price from the order
+    unrealized_pnl=current_pnl,        # computed from current market price
+    wallet_balance=wallet_usdt,        # from fetch_balance()
 )
 ```
 
-The `side`, `size`, and `entry_price` fields are hardcoded to flat/zero/None regardless of what trades were just executed. The DB `positions` table is essentially a historical wallet-balance log, not a live position log.
-
-Why? Actual position tracking happens in `RiskService._positions` (in-memory). The DB record captures what the wallet balance was at cycle time, but not what positions were open.
+This means `GET /positions` returns meaningful position data, and the database can be used as a source of truth for startup recovery via `RiskService.restore_from_db(db)`.
 
 ---
 
@@ -189,14 +186,13 @@ Status values:
 
 - Written: by `ExecutionService._update_positions()` after each BUY/SELL execution
 - Read: by `check_exit_conditions()` on every WebSocket tick, and by `evaluate_decision()` on every cycle
-- Lost on restart: **yes — this is a significant limitation**
+- **Restored on startup** via `RiskService.restore_from_db(db)` — queries the latest filled BUY/SELL execution per asset and reconstructs in-memory positions
 
-On restart, the bot starts with no knowledge of any open positions. It will:
-1. Not trigger stop-losses for positions it doesn't know about
-2. Attempt to BUY again if the AI recommends it (double-entry guard will not fire)
-3. Attempt to SELL will be blocked by the phantom-sell guard
+On startup `restore_from_db` replays the execution log to find the current state for each symbol:
+- If the most recent filled execution for a symbol is a BUY, the position is reconstructed with the fill price and size
+- If the most recent is a SELL (or no executions exist), no position is recorded
 
-See [limitations.md](limitations.md) and [upgrade_guide.md](upgrade_guide.md) for how to address this.
+This means stop-loss and take-profit checks resume correctly after a restart for any position that was properly executed and persisted to the database.
 
 ### `trigger_queue`
 
@@ -216,11 +212,11 @@ See [limitations.md](limitations.md) and [upgrade_guide.md](upgrade_guide.md) fo
 | AI decisions (historical) | Yes | DB is persistent |
 | Execution records | Yes | DB is persistent |
 | Trade log (`logs/trades.jsonl`) | Yes | File is appended, not overwritten |
-| Open positions (which assets held) | **No** | `RiskService._positions` is in-memory |
-| Entry prices of open positions | **No** | In-memory only |
+| Open positions (which assets held) | **Yes** | Restored via `RiskService.restore_from_db(db)` on startup |
+| Entry prices of open positions | **Yes** | Stored in `positions` table, restored on startup |
 | Current market prices | **No** | `MarketStateStore` repopulates from WebSocket |
 | Pending exit orders in queue | **No** | `asyncio.Queue` is in-memory |
-| Paper balance state | N/A | Always resets to `PAPER_BALANCE_USDT` |
+| Paper USDT balance | **Yes** | `ExecutionService.restore_paper_balance_from_db(db)` replays all executions on startup |
 
 ---
 
