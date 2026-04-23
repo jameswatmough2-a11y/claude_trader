@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { Activity, Bot, Clock, LayoutDashboard, Moon, Settings, Sun, Zap } from 'lucide-react'
+import { Activity, Bot, Clock, LayoutDashboard, Moon, ScrollText, Settings, Sun, Zap } from 'lucide-react'
 import { useTheme } from 'next-themes'
 
 import { Badge } from '@/components/ui/badge'
@@ -129,6 +129,9 @@ export function AppSidebar() {
         </NavLink>
         <NavLink href="/settings" icon={<Settings className="size-4" />}>
           Settings
+        </NavLink>
+        <NavLink href="/logs" icon={<ScrollText className="size-4" />}>
+          Logs
         </NavLink>
       </nav>
 

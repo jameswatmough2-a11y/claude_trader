@@ -10,12 +10,15 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import Asset, HourlyMarketSnapshot, Position, AIDecision, Execution
+from app.models.ohlcv_candle import OhlcvCandle
 from app.services.market_state import MarketStateStore
 from app.services.risk_service import RiskService
 from app.services.execution_service import ExecutionService
 from app.services.ai_service import get_trading_decisions
+from app.services.fallback_strategy import get_fallback_decisions
 from app.services.sentiment_service import get_all_sentiment
 from app.services.data_feeds import fetch_balance, fetch_ohlcv
+from app.services import db_logger
 
 logger = logging.getLogger(__name__)
 
@@ -34,37 +37,48 @@ class TradingCycleService:
         self.execution_service = execution_service
 
     def run(self, db: Session) -> None:
-        logger.info("Trading cycle starting")
+        cycle_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         now = datetime.now(timezone.utc)
+
+        logger.info("Trading cycle starting (id=%s)", cycle_id)
+        db_logger.log_info("cycle", "cycle_start", f"Trading cycle starting (id={cycle_id})", cycle_id=cycle_id)
 
         market_data = self._build_market_data()
         if not market_data:
-            logger.warning("No live market data available — skipping cycle (WebSocket not ready?)")
+            msg = "No live market data — skipping cycle (WebSocket not ready?)"
+            logger.warning(msg)
+            db_logger.log_warning("cycle", "cycle_skip", msg, cycle_id=cycle_id)
             return
 
         symbols = list(market_data.keys())
         logger.info("Processing %d symbols: %s", len(symbols), symbols)
 
-        self._enrich_with_ohlcv(market_data)
-        sentiment_data = self._fetch_sentiment(symbols)
+        self._enrich_and_store_ohlcv(market_data, db, cycle_id)
+        sentiment_data = self._fetch_sentiment(symbols, cycle_id)
         open_positions = self.risk_service.get_open_positions()
         previous_decisions = self._fetch_previous_decisions(db, symbols)
-        decisions = self._fetch_decisions(market_data, sentiment_data, open_positions, previous_decisions)
+        decisions = self._fetch_decisions(market_data, sentiment_data, open_positions, previous_decisions, cycle_id)
         filtered = self.risk_service.filter_decisions(decisions, market_data)
 
         for decision in filtered:
             symbol = decision["asset"]
             md = market_data.get(symbol, {})
             try:
-                self._persist_cycle(db, symbol, md, decision, now)
+                self._persist_cycle(db, symbol, md, decision, now, cycle_id)
             except IntegrityError:
                 db.rollback()
                 logger.warning("Duplicate snapshot for %s at %s — skipping", symbol, now.isoformat())
             except Exception:
                 db.rollback()
                 logger.exception("Failed to persist cycle for %s", symbol)
+                db_logger.log_error(
+                    "cycle", "persist_error",
+                    f"Failed to persist cycle for {symbol}",
+                    symbol=symbol, cycle_id=cycle_id,
+                )
 
-        logger.info("Trading cycle complete")
+        logger.info("Trading cycle complete (id=%s)", cycle_id)
+        db_logger.log_info("cycle", "cycle_end", f"Trading cycle complete (id={cycle_id})", cycle_id=cycle_id)
 
     # ── Private helpers ────────────────────────────────────────────────────────
 
@@ -89,22 +103,70 @@ class TradingCycleService:
                 "quote_volume_24h": float(state.volume_24h or 0),
                 "ohlcv": {
                     "last_close": price,
-                    "high_24h": float(state.high_24h or state.last_price),
-                    "low_24h": float(state.low_24h or state.last_price),
-                    "avg_volume_24h": float(state.volume_24h or 0),
-                    "price_change_pct_24h": float(state.price_change_24h_pct or 0),
+                    "high_period": float(state.high_24h or state.last_price),
+                    "low_period": float(state.low_24h or state.last_price),
+                    "avg_volume_period": float(state.volume_24h or 0),
+                    "price_change_pct_period": float(state.price_change_24h_pct or 0),
                     "candles": [],
                 },
                 "orderbook": {},
             }
         return result
 
-    def _enrich_with_ohlcv(self, market_data: dict[str, Any]) -> None:
+    def _enrich_and_store_ohlcv(
+        self,
+        market_data: dict[str, Any],
+        db: Session,
+        cycle_id: str,
+    ) -> None:
+        interval = settings.ohlcv_interval
+        limit = 50  # fetch 50 candles per cycle
+
         for symbol in list(market_data.keys()):
             try:
-                df = fetch_ohlcv(symbol, timeframe="1h", limit=24)
+                df = fetch_ohlcv(symbol, timeframe=interval, limit=limit)
                 if df.empty:
+                    logger.warning("Empty OHLCV response for %s", symbol)
+                    db_logger.log_warning(
+                        "ohlcv", "ohlcv_empty",
+                        f"Empty OHLCV response for {symbol} ({interval})",
+                        symbol=symbol, cycle_id=cycle_id,
+                    )
                     continue
+
+                # Upsert candles into DB
+                inserted = 0
+                for ts, row in df.iterrows():
+                    existing = (
+                        db.query(OhlcvCandle)
+                        .filter_by(symbol=symbol, timeframe=interval, open_time=ts.to_pydatetime())
+                        .first()
+                    )
+                    if existing is None:
+                        db.add(OhlcvCandle(
+                            symbol=symbol,
+                            timeframe=interval,
+                            open_time=ts.to_pydatetime(),
+                            open=Decimal(str(row["open"])),
+                            high=Decimal(str(row["high"])),
+                            low=Decimal(str(row["low"])),
+                            close=Decimal(str(row["close"])),
+                            volume=Decimal(str(row["volume"])),
+                        ))
+                        inserted += 1
+
+                if inserted:
+                    db.flush()
+                    logger.info("OHLCV: upserted %d new %s candles for %s", inserted, interval, symbol)
+
+                db_logger.log_info(
+                    "ohlcv", "ohlcv_fetch",
+                    f"OHLCV fetched for {symbol}: {len(df)} {interval} candles ({inserted} new)",
+                    symbol=symbol, cycle_id=cycle_id,
+                    details={"candle_count": len(df), "new": inserted, "interval": interval},
+                )
+
+                # Build candle list for AI prompt
                 candles = [
                     {
                         "time": str(ts),
@@ -116,26 +178,41 @@ class TradingCycleService:
                     }
                     for ts, row in df.iterrows()
                 ]
+
                 market_data[symbol]["ohlcv"] = {
                     "last_close": float(df["close"].iloc[-1]),
-                    "high_24h": float(df["high"].max()),
-                    "low_24h": float(df["low"].min()),
-                    "avg_volume_24h": float(df["volume"].mean()),
-                    "price_change_pct_24h": round(
+                    "high_period": float(df["high"].max()),
+                    "low_period": float(df["low"].min()),
+                    "avg_volume_period": float(df["volume"].mean()),
+                    "price_change_pct_period": round(
                         (df["close"].iloc[-1] - df["close"].iloc[0]) / df["close"].iloc[0] * 100,
                         2,
-                    ),
+                    ) if float(df["close"].iloc[0]) != 0 else 0.0,
                     "candles": candles,
                 }
-                logger.info("OHLCV enriched for %s (%d candles)", symbol, len(candles))
-            except Exception:
-                logger.warning("OHLCV fetch failed for %s — using WebSocket ticker data", symbol)
 
-    def _fetch_sentiment(self, symbols: list[str]) -> dict[str, Any]:
+            except Exception:
+                logger.warning("OHLCV fetch failed for %s (%s) — using WebSocket ticker data", symbol, interval)
+                db_logger.log_warning(
+                    "ohlcv", "ohlcv_fetch_error",
+                    f"OHLCV fetch failed for {symbol} ({interval}) — using fallback ticker data",
+                    symbol=symbol, cycle_id=cycle_id,
+                )
+
+    def _fetch_sentiment(self, symbols: list[str], cycle_id: str) -> dict[str, Any]:
         try:
-            return get_all_sentiment(symbols)
+            db_logger.log_info("sentiment", "sentiment_fetch_start", "Fetching sentiment data", cycle_id=cycle_id)
+            result = get_all_sentiment(symbols)
+            db_logger.log_info(
+                "sentiment", "sentiment_fetch_done",
+                f"Sentiment fetched for {list(result.keys())}",
+                cycle_id=cycle_id,
+                details={s: {"score": v.score, "sources": v.source_scores} for s, v in result.items()},
+            )
+            return result
         except Exception:
             logger.exception("Sentiment fetch failed — proceeding without sentiment data")
+            db_logger.log_error("sentiment", "sentiment_fetch_error", "Sentiment fetch failed", cycle_id=cycle_id)
             return {}
 
     def _fetch_previous_decisions(
@@ -171,22 +248,35 @@ class TradingCycleService:
         sentiment_data: dict[str, Any],
         open_positions: dict[str, Any],
         previous_decisions: dict[str, Any],
+        cycle_id: str,
     ) -> list[dict[str, Any]]:
         symbols = list(market_data.keys())
+        db_logger.log_info("ai", "ai_request_start", f"Requesting AI decisions for {symbols}", cycle_id=cycle_id)
         try:
-            return get_trading_decisions(market_data, sentiment_data, open_positions, previous_decisions)
-        except Exception:
-            logger.exception("AI decision call failed — defaulting all symbols to HOLD")
-            return [
-                {
-                    "asset": s,
-                    "action": "HOLD",
-                    "confidence": 0.0,
-                    "size_pct": 0,
-                    "reasoning": "AI service unavailable — defaulted to HOLD.",
-                }
-                for s in symbols
-            ]
+            decisions = get_trading_decisions(market_data, sentiment_data, open_positions, previous_decisions)
+            db_logger.log_info(
+                "ai", "ai_request_done",
+                f"AI decisions received for {[d['asset'] for d in decisions]}",
+                cycle_id=cycle_id,
+                details={d["asset"]: {"action": d["action"], "confidence": d["confidence"]} for d in decisions},
+            )
+            return decisions
+        except Exception as exc:
+            logger.exception("AI decision call failed — using rule-based fallback")
+            db_logger.log_warning(
+                "ai", "ai_request_failed",
+                f"AI unavailable ({exc!s:.100}) — switching to rule-based fallback",
+                cycle_id=cycle_id,
+                details={"error": str(exc)},
+            )
+            fallback = get_fallback_decisions(market_data, open_positions)
+            db_logger.log_info(
+                "ai", "fallback_used",
+                f"Fallback decisions produced for {[d['asset'] for d in fallback]}",
+                cycle_id=cycle_id,
+                details={d["asset"]: {"action": d["action"]} for d in fallback},
+            )
+            return fallback
 
     def _fetch_balance(self) -> dict[str, Any]:
         if settings.paper_trading:
@@ -211,17 +301,19 @@ class TradingCycleService:
         md: dict[str, Any],
         decision: dict[str, Any],
         now: datetime,
+        cycle_id: str,
     ) -> None:
         balance = self._fetch_balance()
         asset = self._get_or_create_asset(db, symbol)
 
         price = Decimal(str(md.get("last_price", 0) or 0))
+        ohlcv = md.get("ohlcv", {})
         snapshot = HourlyMarketSnapshot(
             asset_id=asset.id,
             snapshot_time=now,
             open_price=price,
-            high_price=Decimal(str(md.get("high_24h") or price)),
-            low_price=Decimal(str(md.get("low_24h") or price)),
+            high_price=Decimal(str(ohlcv.get("high_period") or md.get("high_24h") or price)),
+            low_price=Decimal(str(ohlcv.get("low_period") or md.get("low_24h") or price)),
             close_price=price,
             volume=Decimal(str(md.get("volume_24h", 0) or 0)),
             price_change_1h_pct=None,
@@ -257,9 +349,10 @@ class TradingCycleService:
         post_balance = self._fetch_balance()
         position.wallet_balance = Decimal(str(post_balance.get("USDT", {}).get("total", 0)))
 
+        decision_source = decision.get("decision_source", "ai")
         ai_rec = AIDecision(
             snapshot_id=snapshot.id,
-            prompt_version="v1",
+            prompt_version="v2",
             model_name=settings.model_name,
             action=decision["action"],
             confidence_score=Decimal(str(decision["confidence"])),
@@ -268,6 +361,7 @@ class TradingCycleService:
             recommended_stop_loss=None,
             recommended_take_profit=None,
             created_at=now,
+            decision_source=decision_source,
         )
         db.add(ai_rec)
         db.flush()
@@ -282,18 +376,41 @@ class TradingCycleService:
         else:
             exec_status = "filled"
 
+        fee_amount = Decimal(str(order.get("fee_amount", 0) or 0))
+        fee_rate = Decimal(str(order.get("fee_rate", settings.taker_fee_rate) or settings.taker_fee_rate))
+        fill_source = order.get("fill_source")
+        verification_status = order.get("verification_status")
+
         execution = Execution(
             ai_decision_id=ai_rec.id,
             executed_action=decision["action"],
             executed_size=Decimal(str(order.get("qty", 0) or 0)),
             execution_price=Decimal(str(order.get("price", 0) or 0)) if order.get("price") else None,
-            fees_paid=Decimal("0"),
+            fees_paid=fee_amount,
+            fee_rate=fee_rate,
             slippage=Decimal("0"),
+            fill_source=fill_source,
+            verification_status=verification_status,
             execution_time=now if decision["action"] != "HOLD" else None,
             status=exec_status,
         )
         db.add(execution)
         db.commit()
+
+        if decision["action"] != "HOLD":
+            db_logger.log_info(
+                "cycle", "decision_executed",
+                f"{symbol}: {decision['action']} (source={decision_source}, "
+                f"confidence={decision['confidence']:.2f}, status={exec_status})",
+                symbol=symbol, cycle_id=cycle_id,
+                details={
+                    "action": decision["action"],
+                    "source": decision_source,
+                    "confidence": decision["confidence"],
+                    "status": exec_status,
+                    "fee_amount": float(fee_amount),
+                },
+            )
 
     def _get_or_create_asset(self, db: Session, symbol: str) -> Asset:
         asset = db.query(Asset).filter(Asset.symbol == symbol).first()

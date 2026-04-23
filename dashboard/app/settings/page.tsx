@@ -12,6 +12,7 @@ import { useDisplayPrefs } from '@/app/providers/display-prefs-provider'
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 const CHART_INTERVALS = ['1m', '5m', '15m', '1h', '4h', '1d'] as const
+const OHLCV_INTERVALS = ['1m', '5m', '15m', '1h', '4h', '1d'] as const
 
 const CLAUDE_MODELS = [
   'claude-sonnet-4-6',
@@ -32,6 +33,8 @@ interface Config {
   model_name: string
   timezone: string
   display_currency: string
+  ohlcv_interval: string
+  taker_fee_rate: number
 }
 
 const DEFAULTS: Config = {
@@ -47,6 +50,8 @@ const DEFAULTS: Config = {
   model_name: 'claude-sonnet-4-6',
   timezone: 'UTC',
   display_currency: 'USD',
+  ohlcv_interval: '1h',
+  taker_fee_rate: 0.001,
 }
 
 const DISPLAY_KEYS: (keyof Config)[] = ['chart_interval', 'timezone', 'display_currency']
@@ -186,6 +191,8 @@ export default function SettingsPage() {
     model_name: (data.model_name as string) ?? DEFAULTS.model_name,
     timezone: (data.timezone as string) ?? DEFAULTS.timezone,
     display_currency: (data.display_currency as string) ?? DEFAULTS.display_currency,
+    ohlcv_interval: (data.ohlcv_interval as string) ?? DEFAULTS.ohlcv_interval,
+    taker_fee_rate: (data.taker_fee_rate as number) ?? DEFAULTS.taker_fee_rate,
   })
 
   const fetchStatus = useCallback(async () => {
@@ -348,6 +355,21 @@ export default function SettingsPage() {
               </SettingRow>
             </div>
 
+            <div className="py-5">
+              <SettingRow
+                label="OHLCV Interval"
+                description="Candle timeframe for AI analysis. Candles are fetched at this interval each cycle."
+              >
+                <div className="flex flex-wrap gap-1.5">
+                  {OHLCV_INTERVALS.map(tf => (
+                    <button key={tf} onClick={() => setStr('ohlcv_interval')(tf)} disabled={td} className={btnCls(config.ohlcv_interval === tf)}>
+                      {tf}
+                    </button>
+                  ))}
+                </div>
+              </SettingRow>
+            </div>
+
           </div>
         </div>
 
@@ -424,6 +446,15 @@ export default function SettingsPage() {
                 description="Virtual USDT balance for paper trades. Takes effect after Reset DB."
               >
                 <NumberInput value={config.paper_balance_usdt} onChange={setNum('paper_balance_usdt')} min={100} max={10_000_000} step={100} disabled={td} />
+              </SettingRow>
+            </div>
+
+            <div className="py-5">
+              <SettingRow
+                label="Taker Fee Rate"
+                description="Exchange taker fee as a decimal (0.001 = 0.1%). Applied to paper fills and estimated for live."
+              >
+                <NumberInput value={config.taker_fee_rate} onChange={setNum('taker_fee_rate')} min={0} max={0.05} step={0.0001} disabled={td} />
               </SettingRow>
             </div>
 

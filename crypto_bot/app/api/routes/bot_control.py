@@ -49,6 +49,8 @@ class ConfigPayload(BaseModel):
     model_name: str = Field(default="claude-sonnet-4-6")
     timezone: str = Field(default="UTC")
     display_currency: str = Field(default="USD")
+    ohlcv_interval: str = Field(default="1h")
+    taker_fee_rate: float = Field(ge=0.0, le=0.05, default=0.001)
 
 
 @router.get("/config")
@@ -79,6 +81,8 @@ async def put_config(payload: ConfigPayload, db: Session = Depends(get_db)) -> d
     row.model_name = payload.model_name.strip()
     row.timezone = payload.timezone.strip() or "UTC"
     row.display_currency = payload.display_currency.strip().upper() or "USD"
+    row.ohlcv_interval = payload.ohlcv_interval.strip() or "1h"
+    row.taker_fee_rate = payload.taker_fee_rate
     row.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(row)
@@ -114,6 +118,8 @@ async def start(db: Session = Depends(get_db)) -> dict:
     )
     bot_state.running = True
     logger.info("Bot started — interval=%d min", interval)
+    from app.services import db_logger
+    db_logger.log_info("system", "bot_start", f"Bot started — interval={interval} min")
     return {"running": True, "message": "Bot started"}
 
 
@@ -128,6 +134,8 @@ def stop() -> dict:
         pass
     bot_state.running = False
     logger.info("Bot stopped by user")
+    from app.services import db_logger
+    db_logger.log_info("system", "bot_stop", "Bot stopped by user")
     return {"running": False, "message": "Bot stopped"}
 
 
@@ -141,11 +149,15 @@ def reset(db: Session = Depends(get_db)) -> dict:
         bot_state.running = False
 
     # Clear all trading data in FK-safe cascade order
+    from app.models.system_log import SystemLog
+    from app.models.ohlcv_candle import OhlcvCandle
     db.query(Execution).delete()
     db.query(AIDecision).delete()
     db.query(Position).delete()
     db.query(HourlyMarketSnapshot).delete()
     db.query(Asset).delete()
+    db.query(OhlcvCandle).delete()
+    db.query(SystemLog).delete()
     db.commit()
 
     # Reset in-memory state
@@ -176,6 +188,8 @@ def _apply_settings(row: BotConfig) -> None:
     settings.take_profit_pct = row.take_profit_pct
     settings.paper_balance_usdt = row.paper_balance_usdt
     settings.model_name = row.model_name
+    settings.ohlcv_interval = getattr(row, "ohlcv_interval", "1h") or "1h"
+    settings.taker_fee_rate = getattr(row, "taker_fee_rate", 0.001) or 0.001
     if row.tracked_symbols:
         settings.tracked_symbols = [s.strip().upper() for s in row.tracked_symbols.split(",") if s.strip()]
 

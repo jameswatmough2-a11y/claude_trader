@@ -22,6 +22,9 @@ class Settings:
     stop_loss_pct: float = field(default_factory=lambda: float(os.getenv("STOP_LOSS_PCT", "5")))
     take_profit_pct: float = field(default_factory=lambda: float(os.getenv("TAKE_PROFIT_PCT", "0")))
 
+    ohlcv_interval: str = field(default_factory=lambda: os.getenv("OHLCV_INTERVAL", "1h"))
+    taker_fee_rate: float = field(default_factory=lambda: float(os.getenv("TAKER_FEE_RATE", "0.001")))
+
     def __post_init__(self) -> None:
         raw = os.getenv("TRACKED_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT")
         self.tracked_symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]

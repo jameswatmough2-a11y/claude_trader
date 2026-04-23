@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -33,7 +34,6 @@ class ExecutionService:
         return self._paper_usdt
 
     def restore_paper_balance_from_db(self, db: "Session") -> None:
-        """Compute paper USDT balance by replaying all filled executions from DB."""
         from app.models.execution import Execution
 
         balance = settings.paper_balance_usdt
@@ -60,13 +60,18 @@ class ExecutionService:
         market_data: dict[str, Any],
         balance: dict[str, Any],
     ) -> dict[str, Any]:
+        from app.services import db_logger
+
         asset = decision["asset"].upper()
         action = decision["action"].upper()
 
         md = market_data.get(asset, {})
-        current_price = float(md.get("last_price", 0) or 0)
+        last_price = float(md.get("last_price", 0) or 0)
+        bid = float(md.get("bid") or last_price)
+        ask = float(md.get("ask") or last_price)
         portfolio_usdt = float(balance.get("USDT", {}).get("total", 0))
         timestamp = datetime.now(timezone.utc).isoformat()
+        fee_rate = settings.taker_fee_rate
 
         record: dict[str, Any] = {
             "timestamp": timestamp,
@@ -74,7 +79,7 @@ class ExecutionService:
             "action": action,
             "confidence": decision["confidence"],
             "size_pct": decision["size_pct"],
-            "current_price": current_price,
+            "current_price": last_price,
             "portfolio_usdt": portfolio_usdt,
             "reasoning": decision["reasoning"],
             "paper_trading": settings.paper_trading,
@@ -87,11 +92,22 @@ class ExecutionService:
             return record
 
         if settings.paper_trading:
-            self._execute_paper(record, asset, action, current_price, portfolio_usdt, timestamp)
+            self._execute_paper(record, asset, action, last_price, bid, ask, portfolio_usdt, timestamp, fee_rate)
         else:
-            self._execute_live(record, asset, action, current_price, portfolio_usdt)
+            self._execute_live(record, asset, action, last_price, portfolio_usdt, fee_rate)
 
         self._log(record)
+
+        if record.get("order") and not record.get("error"):
+            db_logger.log_info(
+                "execution", "order_placed",
+                f"{action} {asset}: qty={record['order'].get('qty', 0):.6f} "
+                f"@ {record['order'].get('price', 0):.4f} "
+                f"fee={record['order'].get('fee_amount', 0):.4f} USDT",
+                symbol=asset,
+                details={"action": action, "order": record["order"]},
+            )
+
         return record
 
     def execute_all_decisions(
@@ -102,56 +118,173 @@ class ExecutionService:
     ) -> list[dict[str, Any]]:
         return [self.execute_decision(d, market_data, balance) for d in decisions]
 
+    # ── Paper execution ────────────────────────────────────────────────────────
+
     def _execute_paper(
         self,
         record: dict[str, Any],
         asset: str,
         action: str,
-        price: float,
+        last_price: float,
+        bid: float,
+        ask: float,
         portfolio_usdt: float,
         timestamp: str,
+        fee_rate: float,
     ) -> None:
+        from app.services.market_validator import validate_and_normalize_qty
+        from app.services import db_logger
+
+        # Use ask for BUY (taker buys at ask), bid for SELL (taker sells at bid)
+        if action == "BUY":
+            fill_price = ask if ask > 0 else last_price
+            fill_source = "ask" if ask > 0 else "last_price_fallback"
+        else:
+            fill_price = bid if bid > 0 else last_price
+            fill_source = "bid" if bid > 0 else "last_price_fallback"
+
+        if fill_source.endswith("fallback"):
+            db_logger.log_warning(
+                "execution", "fill_price_fallback",
+                f"No bid/ask for {asset} — using last_price for paper fill",
+                symbol=asset,
+            )
+
         try:
-            qty = self._compute_qty(asset, record["size_pct"], price, portfolio_usdt)
-            record["order"] = {
-                "id": f"PAPER-{timestamp}",
-                "symbol": asset,
-                "side": action.lower(),
-                "type": "market",
-                "qty": qty,
-                "price": price,
-                "status": "paper_filled",
-            }
-            cost = qty * price
-            if action == "BUY":
-                self._paper_usdt -= cost
-            elif action == "SELL":
-                self._paper_usdt += cost
-            logger.info("Paper balance after %s %s: %.2f USDT", action, asset, self._paper_usdt)
-            self._update_positions(asset, action, price, record["size_pct"])
+            raw_qty = self._compute_qty(asset, record["size_pct"], fill_price, portfolio_usdt)
         except ValueError as exc:
             record["error"] = str(exc)
             logger.warning("Paper order skipped for %s: %s", asset, exc)
+            return
+
+        qty, validation_error = validate_and_normalize_qty(asset, raw_qty, fill_price)
+        if validation_error:
+            record["error"] = f"Order validation failed: {validation_error}"
+            db_logger.log_warning(
+                "execution", "order_validation_failed",
+                f"Paper order rejected for {asset}: {validation_error}",
+                symbol=asset,
+                details={"raw_qty": raw_qty, "fill_price": fill_price},
+            )
+            logger.warning("Paper order rejected for %s: %s", asset, validation_error)
+            return
+
+        cost = qty * fill_price
+        fee_amount = cost * fee_rate
+
+        record["order"] = {
+            "id": f"PAPER-{timestamp}",
+            "symbol": asset,
+            "side": action.lower(),
+            "type": "market",
+            "qty": qty,
+            "price": fill_price,
+            "fee_amount": fee_amount,
+            "fee_rate": fee_rate,
+            "fill_source": fill_source,
+            "status": "paper_filled",
+        }
+
+        if action == "BUY":
+            self._paper_usdt -= (cost + fee_amount)
+        elif action == "SELL":
+            self._paper_usdt += (cost - fee_amount)
+
+        self._paper_usdt = max(0.0, self._paper_usdt)
+        logger.info(
+            "Paper %s %s: qty=%.6f @ %.4f fee=%.4f USDT | balance=%.2f",
+            action, asset, qty, fill_price, fee_amount, self._paper_usdt,
+        )
+        self._update_positions(asset, action, fill_price, record["size_pct"])
+
+    # ── Live execution ─────────────────────────────────────────────────────────
 
     def _execute_live(
         self,
         record: dict[str, Any],
         asset: str,
         action: str,
-        price: float,
+        last_price: float,
         portfolio_usdt: float,
+        fee_rate: float,
     ) -> None:
+        from app.services.market_validator import validate_and_normalize_qty
+        from app.services import db_logger
+
         try:
-            qty = self._compute_qty(asset, record["size_pct"], price, portfolio_usdt)
+            raw_qty = self._compute_qty(asset, record["size_pct"], last_price, portfolio_usdt)
+        except ValueError as exc:
+            record["error"] = str(exc)
+            logger.exception("Live order qty error for %s", asset)
+            return
+
+        qty, validation_error = validate_and_normalize_qty(asset, raw_qty, last_price)
+        if validation_error:
+            record["error"] = f"Order validation failed: {validation_error}"
+            db_logger.log_warning(
+                "execution", "order_validation_failed",
+                f"Live order rejected for {asset}: {validation_error}",
+                symbol=asset,
+                details={"raw_qty": raw_qty, "price": last_price},
+            )
+            return
+
+        try:
             side = "buy" if action == "BUY" else "sell"
             ccxt_symbol = f"{asset[:-4]}/USDT" if asset.endswith("USDT") and "/" not in asset else asset
             order = get_exchange().create_market_order(ccxt_symbol, side, qty)
-            record["order"] = order
-            filled_price = float(order.get("average") or price)
+
+            # Verify fill after placement
+            verification_status = "unverified"
+            filled_price = last_price
+            filled_qty = qty
+
+            try:
+                time.sleep(1)  # brief wait for exchange to process
+                fetched = get_exchange().fetch_order(order["id"], ccxt_symbol)
+                status = fetched.get("status", "unknown")
+                if status == "closed":
+                    verification_status = "filled"
+                    filled_price = float(fetched.get("average") or fetched.get("price") or last_price)
+                    filled_qty = float(fetched.get("filled") or qty)
+                elif status == "open":
+                    verification_status = "partial_or_open"
+                    filled_price = float(fetched.get("average") or last_price)
+                    filled_qty = float(fetched.get("filled") or 0)
+                    logger.warning("Live order %s for %s is still open after placement", order["id"], asset)
+                else:
+                    verification_status = f"unknown_{status}"
+            except Exception as ve:
+                logger.warning("Fill verification failed for %s order %s: %s", asset, order.get("id"), ve)
+                verification_status = "verification_failed"
+                filled_price = float(order.get("average") or last_price)
+
+            fee_amount = filled_qty * filled_price * fee_rate
+
+            record["order"] = {
+                **order,
+                "qty": filled_qty,
+                "price": filled_price,
+                "fee_amount": fee_amount,
+                "fee_rate": fee_rate,
+                "fill_source": "live",
+                "verification_status": verification_status,
+            }
+
+            db_logger.log_info(
+                "execution", "live_order_verified",
+                f"Live {action} {asset}: qty={filled_qty:.6f} @ {filled_price:.4f} status={verification_status}",
+                symbol=asset,
+                details={"verification_status": verification_status, "order_id": order.get("id")},
+            )
+
             self._update_positions(asset, action, filled_price, record["size_pct"])
+
         except (ccxt.BaseError, ValueError, Exception) as exc:
             record["error"] = str(exc)
             logger.exception("Live order failed for %s", asset)
+
+    # ── Helpers ────────────────────────────────────────────────────────────────
 
     def _compute_qty(self, symbol: str, size_pct: float, price: float, portfolio_usdt: float) -> float:
         if price <= 0:

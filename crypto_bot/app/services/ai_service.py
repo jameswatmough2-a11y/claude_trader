@@ -27,6 +27,7 @@ def _get_client() -> anthropic.Anthropic:
 def _build_system_prompt() -> str:
     min_conf = settings.min_confidence
     max_pos = int(settings.max_position_pct)
+    interval = settings.ohlcv_interval
     return f"""You are a disciplined crypto trading analyst. Evaluate the provided market and sentiment data, then return a JSON array of trading decisions — one object per asset.
 
 Decision schema (strict):
@@ -45,6 +46,7 @@ Rules:
 - Only recommend BUY or SELL when confidence ≥ {min_conf:.2f}. Below that threshold, use HOLD.
 - If a position is currently OPEN for an asset: you may recommend SELL (to exit) or HOLD (to keep it). Do NOT recommend BUY on an already-open position.
 - If NO position is open for an asset: you may recommend BUY (to enter) or HOLD (to stay flat). Do NOT recommend SELL on an asset with no position.
+- Market data is based on {interval} candles. Last N closes show the trend for that interval.
 - Be willing to act — HOLD everything is not a useful response if the data supports a trade."""
 
 
@@ -55,12 +57,12 @@ def _build_prompt(
     previous_decisions: dict[str, Any] | None = None,
 ) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    interval = settings.ohlcv_interval
     lines: list[str] = [
-        f"=== HOURLY TRADING ANALYSIS — {now} ===",
+        f"=== TRADING ANALYSIS ({interval} candles) — {now} ===",
         "",
     ]
 
-    # Current position context — critical for SELL decisions
     lines.append("=== CURRENT POSITIONS ===")
     if not open_positions:
         lines.append("No open positions — all assets are currently flat.")
@@ -80,7 +82,6 @@ def _build_prompt(
                 lines.append(f"  {symbol}: flat — no position")
     lines.append("")
 
-    # Previous decision context — helps Claude reason about continuing vs reversing
     symbols = list(market_data.keys()) or settings.tracked_symbols
     lines.append("=== PREVIOUS DECISIONS (last cycle) ===")
     if not previous_decisions:
@@ -98,8 +99,7 @@ def _build_prompt(
                 lines.append(f"  {symbol}: no previous decision")
     lines.append("")
 
-    lines.append("=== MARKET DATA ===")
-    symbols = list(market_data.keys()) or settings.tracked_symbols
+    lines.append(f"=== MARKET DATA ({interval} candles) ===")
     for symbol in symbols:
         lines.append(f"--- {symbol} ---")
         md = market_data.get(symbol, {})
@@ -114,19 +114,20 @@ def _build_prompt(
                 f"Ask: ${float(md.get('ask', 0) or 0):,.4f}"
             )
             lines.append(
-                f"24h High: ${float(ohlcv.get('high_24h', 0) or 0):,.4f}  "
-                f"24h Low: ${float(ohlcv.get('low_24h', 0) or 0):,.4f}  "
-                f"Change: {ohlcv.get('price_change_pct_24h', 'N/A')}%"
+                f"{interval} range — High: ${float(ohlcv.get('high_period', 0) or 0):,.4f}  "
+                f"Low: ${float(ohlcv.get('low_period', 0) or 0):,.4f}  "
+                f"Change: {ohlcv.get('price_change_pct_period', 'N/A')}%"
             )
             lines.append(
-                f"Avg 24h Volume: {float(ohlcv.get('avg_volume_24h', 0) or 0):,.0f}  "
+                f"Avg Volume ({interval}): {float(ohlcv.get('avg_volume_period', 0) or 0):,.0f}  "
                 f"Quote Volume: ${float(md.get('quote_volume_24h', 0) or 0):,.0f}"
             )
 
             candles = ohlcv.get("candles", [])
             if candles:
-                recent_closes = " → ".join(f"${c['close']:,.2f}" for c in candles[-6:])
-                lines.append(f"Last 6h closes: {recent_closes}")
+                recent = candles[-6:]
+                recent_closes = " → ".join(f"${float(c['close']):,.2f}" for c in recent)
+                lines.append(f"Last {len(recent)} {interval} closes: {recent_closes}")
 
         sent = sentiment_data.get(symbol)
         if sent:
@@ -191,6 +192,7 @@ def _validate_decisions(raw: list[Any], symbols: list[str]) -> list[dict[str, An
             "confidence": round(confidence, 4),
             "size_pct": size_pct,
             "reasoning": reasoning,
+            "decision_source": "ai",
         })
 
     covered = {d["asset"] for d in validated}
@@ -202,6 +204,7 @@ def _validate_decisions(raw: list[Any], symbols: list[str]) -> list[dict[str, An
                 "confidence": 0.0,
                 "size_pct": 0,
                 "reasoning": "Missing from model response — defaulted to HOLD.",
+                "decision_source": "ai",
             })
 
     return validated

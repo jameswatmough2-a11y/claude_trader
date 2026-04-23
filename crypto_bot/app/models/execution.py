@@ -31,7 +31,10 @@ class Execution(Base):
     execution_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 8), nullable=True)
 
     fees_paid: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 8), nullable=True)
+    fee_rate: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 6), nullable=True)
     slippage: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 8), nullable=True)
+    fill_source: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    verification_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
 
     execution_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False)  # filled, rejected, none

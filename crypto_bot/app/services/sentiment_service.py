@@ -1,14 +1,27 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from typing import Optional
 
 import feedparser
 import requests
 from textblob import TextBlob
 
 logger = logging.getLogger(__name__)
+
+# ── TTL cache ──────────────────────────────────────────────────────────────────
+
+_SENTIMENT_TTL_SECONDS = 1800  # 30 minutes
+_FEAR_GREED_TTL_SECONDS = 1800
+
+_sentiment_cache: dict[str, tuple[float, "AssetSentiment"]] = {}
+_fear_greed_cache: tuple[float, Optional[int]] = (0.0, None)
+
+# ── Config ─────────────────────────────────────────────────────────────────────
 
 ASSET_KEYWORDS: dict[str, list[str]] = {
     "BTCUSDT": ["bitcoin", "btc"],
@@ -32,9 +45,10 @@ RSS_HEADERS = {
     "Accept": "application/rss+xml, application/xml, text/xml, */*",
 }
 
-REDDIT_SUBS = ["cryptocurrency", "bitcoin", "ethtrader"]
 REDDIT_HEADERS = {"User-Agent": "crypto_sentiment_bot/1.0"}
 
+
+# ── Data types ─────────────────────────────────────────────────────────────────
 
 @dataclass
 class AssetSentiment:
@@ -43,8 +57,22 @@ class AssetSentiment:
     headline_count: int
     top_headlines: list[str] = field(default_factory=list)
     source_scores: dict[str, float] = field(default_factory=dict)
-    fear_greed_index: int | None = None
+    fear_greed_index: Optional[int] = None
 
+
+# ── Text sanitization ──────────────────────────────────────────────────────────
+
+def _sanitize(text: str, max_len: int = 200) -> str:
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = re.sub(r'[*_`#\[\]()\\|]', ' ', text)
+    text = re.sub(r'https?://\S+', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    if len(text) > max_len:
+        text = text[:max_len].rsplit(' ', 1)[0]
+    return text
+
+
+# ── Scoring helpers ────────────────────────────────────────────────────────────
 
 def _polarity(text: str) -> float:
     return float(TextBlob(text).sentiment.polarity)
@@ -63,28 +91,29 @@ def _matches(text: str, keywords: list[str]) -> bool:
     return any(kw.lower() in lower for kw in keywords)
 
 
-def _rss_sentiment(keywords: list[str]) -> tuple[float, list[str]]:
+# ── Data sources ───────────────────────────────────────────────────────────────
+
+def _fetch_rss(keywords: list[str]) -> tuple[float, list[str]]:
     scores: list[float] = []
     headlines: list[tuple[float, str]] = []
 
     for url in RSS_FEEDS:
         try:
-            resp = requests.get(url, headers=RSS_HEADERS, timeout=10)
+            resp = requests.get(url, headers=RSS_HEADERS, timeout=8)
             resp.raise_for_status()
             feed = feedparser.parse(resp.content)
             if not feed.entries:
-                logger.warning("RSS: no entries from %s", url)
                 continue
             for entry in feed.entries[:40]:
-                title = entry.get("title", "")
-                summary = entry.get("summary", "")
+                title = _sanitize(entry.get("title", ""), 180)
+                summary = _sanitize(entry.get("summary", ""), 200)
                 combined = f"{title} {summary}"
                 if not _matches(combined, keywords):
                     continue
                 score = _clamp(_polarity(combined))
                 scores.append(score)
                 headlines.append((abs(score), title))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("RSS fetch failed for %s: %s", url, exc)
 
     if not scores:
@@ -94,39 +123,27 @@ def _rss_sentiment(keywords: list[str]) -> tuple[float, list[str]]:
     return _clamp(_mean(scores)), [h for _, h in headlines[:3]]
 
 
-def _reddit_sentiment(keywords: list[str]) -> tuple[float, list[str]]:
+def _fetch_reddit(keywords: list[str]) -> tuple[float, list[str]]:
     primary_kw = keywords[0]
     weighted_scores: list[tuple[float, float]] = []
     headlines: list[tuple[float, str]] = []
 
-    for sub in REDDIT_SUBS:
+    for sub in ["cryptocurrency", "bitcoin", "ethtrader"]:
         url = f"https://www.reddit.com/r/{sub}/search.json"
-        params = {
-            "q": primary_kw,
-            "sort": "hot",
-            "t": "day",
-            "limit": 25,
-            "restrict_sr": "true",
-        }
-
+        params = {"q": primary_kw, "sort": "hot", "t": "day", "limit": 25, "restrict_sr": "true"}
         try:
-            resp = requests.get(url, params=params, headers=REDDIT_HEADERS, timeout=10)
+            resp = requests.get(url, params=params, headers=REDDIT_HEADERS, timeout=8)
             resp.raise_for_status()
             posts = resp.json().get("data", {}).get("children", [])
-        except Exception as exc:  # noqa: BLE001
+            for post in posts:
+                data = post.get("data", {})
+                title = _sanitize(data.get("title", ""), 180)
+                upvotes = max(float(data.get("score", 1)), 1.0)
+                score = _clamp(_polarity(title))
+                weighted_scores.append((score, upvotes))
+                headlines.append((abs(score), title))
+        except Exception as exc:
             logger.warning("Reddit fetch failed for r/%s: %s", sub, exc)
-            time.sleep(1)
-            continue
-
-        for post in posts:
-            data = post.get("data", {})
-            title = data.get("title", "")
-            upvotes = max(float(data.get("score", 1)), 1.0)
-            score = _clamp(_polarity(title))
-            weighted_scores.append((score, upvotes))
-            headlines.append((abs(score), title))
-
-        time.sleep(1)
 
     if not weighted_scores:
         return 0.0, []
@@ -137,13 +154,21 @@ def _reddit_sentiment(keywords: list[str]) -> tuple[float, list[str]]:
     return mean_score, [h for _, h in headlines[:3]]
 
 
-def _fear_greed_index() -> int | None:
+def _fetch_fear_greed() -> Optional[int]:
+    global _fear_greed_cache
+    ts, cached_value = _fear_greed_cache
+    if time.time() - ts < _FEAR_GREED_TTL_SECONDS:
+        return cached_value
+
     try:
         resp = requests.get("https://api.alternative.me/fng/?limit=1", timeout=8)
         resp.raise_for_status()
-        return int(resp.json()["data"][0]["value"])
-    except Exception as exc:  # noqa: BLE001
+        value = int(resp.json()["data"][0]["value"])
+        _fear_greed_cache = (time.time(), value)
+        return value
+    except Exception as exc:
         logger.warning("Fear & Greed fetch failed: %s", exc)
+        _fear_greed_cache = (time.time(), None)
         return None
 
 
@@ -151,26 +176,26 @@ def _fear_greed_to_score(value: int) -> float:
     return _clamp((value - 50) / 50.0)
 
 
-def get_asset_sentiment(symbol: str, fear_greed: int | None = None) -> AssetSentiment:
+# ── Per-asset sentiment ────────────────────────────────────────────────────────
+
+def _compute_asset_sentiment(symbol: str, fear_greed: Optional[int]) -> AssetSentiment:
     symbol = symbol.upper()
     keywords = ASSET_KEYWORDS.get(symbol, [symbol.replace("USDT", "").lower()])
 
-    source_scores: dict[str, float] = {}
-    all_headlines: list[str] = []
+    # Fetch RSS and Reddit concurrently
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        rss_future = pool.submit(_fetch_rss, keywords)
+        reddit_future = pool.submit(_fetch_reddit, keywords)
+        rss_score, rss_headlines = rss_future.result()
+        reddit_score, reddit_headlines = reddit_future.result()
 
-    rss_score, rss_headlines = _rss_sentiment(keywords)
-    source_scores["rss"] = rss_score
-    all_headlines.extend(rss_headlines)
-
-    reddit_score, reddit_headlines = _reddit_sentiment(keywords)
-    source_scores["reddit"] = reddit_score
-    all_headlines.extend(reddit_headlines)
-
+    source_scores: dict[str, float] = {"rss": rss_score, "reddit": reddit_score}
     if fear_greed is not None:
         source_scores["fear_greed"] = _fear_greed_to_score(fear_greed)
 
     blended = _clamp(_mean(list(source_scores.values())))
 
+    all_headlines = rss_headlines + reddit_headlines
     seen: set[str] = set()
     unique_headlines: list[str] = []
     for headline in all_headlines:
@@ -191,6 +216,36 @@ def get_asset_sentiment(symbol: str, fear_greed: int | None = None) -> AssetSent
     )
 
 
+def get_asset_sentiment(symbol: str, fear_greed: Optional[int] = None) -> AssetSentiment:
+    symbol = symbol.upper()
+    ts, cached = _sentiment_cache.get(symbol, (0.0, None))
+    if cached is not None and time.time() - ts < _SENTIMENT_TTL_SECONDS:
+        logger.info("Sentiment cache hit for %s (age %.0fs)", symbol, time.time() - ts)
+        return cached
+
+    logger.info("Fetching fresh sentiment for %s", symbol)
+    result = _compute_asset_sentiment(symbol, fear_greed)
+    _sentiment_cache[symbol] = (time.time(), result)
+    return result
+
+
 def get_all_sentiment(symbols: list[str]) -> dict[str, AssetSentiment]:
-    fear_greed = _fear_greed_index()
-    return {symbol.upper(): get_asset_sentiment(symbol, fear_greed) for symbol in symbols}
+    # Fear & Greed is global — fetch once and share
+    fear_greed = _fetch_fear_greed()
+
+    # Fetch all symbols concurrently (each symbol's sources are already concurrent inside)
+    results: dict[str, AssetSentiment] = {}
+    with ThreadPoolExecutor(max_workers=min(len(symbols), 4)) as pool:
+        futures = {pool.submit(get_asset_sentiment, sym, fear_greed): sym for sym in symbols}
+        for future in as_completed(futures):
+            sym = futures[future]
+            try:
+                results[sym.upper()] = future.result()
+            except Exception as exc:
+                logger.warning("Sentiment failed for %s: %s", sym, exc)
+
+    return results
+
+
+def clear_sentiment_cache() -> None:
+    _sentiment_cache.clear()

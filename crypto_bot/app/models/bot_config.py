@@ -30,6 +30,8 @@ class BotConfig(Base):
     model_name: Mapped[str] = mapped_column(String(100), nullable=False, default="claude-sonnet-4-6")
     timezone: Mapped[str] = mapped_column(String(50), nullable=False, default="UTC")
     display_currency: Mapped[str] = mapped_column(String(10), nullable=False, default="USD")
+    ohlcv_interval: Mapped[str] = mapped_column(String(10), nullable=False, default="1h")
+    taker_fee_rate: Mapped[float] = mapped_column(Float, nullable=False, default=0.001)
 
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
@@ -48,6 +50,8 @@ class BotConfig(Base):
             "model_name": "claude-sonnet-4-6",
             "timezone": "UTC",
             "display_currency": "USD",
+            "ohlcv_interval": "1h",
+            "taker_fee_rate": 0.001,
         }
 
     def to_dict(self) -> dict:
@@ -64,5 +68,7 @@ class BotConfig(Base):
             "model_name": self.model_name,
             "timezone": self.timezone,
             "display_currency": self.display_currency,
+            "ohlcv_interval": self.ohlcv_interval,
+            "taker_fee_rate": self.taker_fee_rate,
             "updated_at": self.updated_at.isoformat(),
         }

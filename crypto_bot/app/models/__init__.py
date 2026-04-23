@@ -5,6 +5,8 @@ from .position import Position
 from .ai_decision import AIDecision
 from .execution import Execution
 from .bot_config import BotConfig
+from .system_log import SystemLog
+from .ohlcv_candle import OhlcvCandle
 
 __all__ = [
     "Base",
@@ -14,4 +16,6 @@ __all__ = [
     "AIDecision",
     "Execution",
     "BotConfig",
+    "SystemLog",
+    "OhlcvCandle",
 ]

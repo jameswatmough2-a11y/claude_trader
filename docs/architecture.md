@@ -2,14 +2,14 @@
 
 ## System Overview
 
-Claude Trader is structured as a **single-process FastAPI application** running inside Python's `asyncio` event loop. Two concurrent async tasks run for the lifetime of the process:
+Claude Trader is a **single-process FastAPI application** running inside Python's `asyncio` event loop. Two concurrent async tasks run for the lifetime of the process:
 
 1. **BinanceWebSocketService** — maintains a persistent WebSocket connection to Binance and processes every price tick
 2. **TriggerExecutor** — drains an `asyncio.Queue` of real-time exit orders (stop-loss / take-profit) produced by the WebSocket task
 
-A third loop is driven by **APScheduler** once per hour:
+A third loop is driven by **APScheduler** at a configurable interval:
 
-3. **TradingCycleService** — reads the current price cache, calls Claude, applies risk rules, executes decisions, and writes results to the database
+3. **TradingCycleService** — reads the current price cache, fetches real OHLCV candles, calls Claude (or falls back to rule-based logic), applies risk rules, executes decisions, and writes results to the database
 
 These are orchestrated from `app/main.py` via a FastAPI lifespan context manager.
 
@@ -20,20 +20,21 @@ These are orchestrated from `app/main.py` via a FastAPI lifespan context manager
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    FastAPI HTTP layer                        │
-│          /health  /assets  /positions  /decisions            │
+│   /health  /assets  /positions  /decisions  /logs           │
 └────────────────────────┬────────────────────────────────────┘
                          │ reads DB via SQLAlchemy
 ┌────────────────────────▼────────────────────────────────────┐
 │                    Persistence layer                         │
-│             SQLite + SQLAlchemy ORM (5 tables)               │
+│             SQLite + SQLAlchemy ORM (7 tables)               │
 │   assets  /  hourly_market_snapshots  /  positions           │
 │   ai_decisions  /  executions                                │
+│   ohlcv_candles  /  system_logs                              │
 └───────────────────┬──────────────────────────────────────────┘
           ▲ writes  │
           │         │
 ┌─────────┴────────────────┐       ┌────────────────────────┐
 │   Trading Cycle           │       │   Trigger Executor      │
-│   (hourly, sync thread)   │       │   (async queue drain)   │
+│   (scheduled, sync thread)│       │   (async queue drain)   │
 └─────────┬────────────────┘       └──────────┬─────────────┘
           │ reads                              │ executes SELL
           │                                   │ consumes trigger_queue
@@ -63,11 +64,14 @@ All service instances are created at **module level** (singletons for the proces
 
 ```python
 # Startup sequence (inside lifespan):
-init_db()                                    # 1. Create SQLite tables
+init_db()                                    # 1. Create/migrate SQLite tables
 asyncio.create_task(ws_service.run_forever()) # 2. Start WebSocket stream
 asyncio.create_task(trigger_executor.run_forever()) # 3. Start exit processor
-scheduler.add_job(run_hourly_cycle, ...)     # 4. Schedule hourly cycle
-scheduler.start()                            # 5. Fire first cycle immediately
+restore_state()                              # 4. Restore positions + paper balance from DB
+_reconcile_live_positions()                  # 5. Live mode: compare internal state vs exchange
+db_logger.log_info(...)                      # 6. Log server_start event
+scheduler.add_job(run_hourly_cycle, ...)     # 7. Schedule trading cycle
+scheduler.start()                            # 8. Fire first cycle immediately
 ```
 
 Service wiring is explicit constructor injection — each service receives its dependencies at creation time:
@@ -98,132 +102,145 @@ A `dict[str, SymbolMarketState]` wrapped in a class. Holds the most recent 24h t
 | `low_24h` | `Decimal` | `l` field |
 | `updated_at` | `datetime` | Set at update time |
 
-The store has no locking. CPython's GIL serializes dict reads/writes, which is sufficient here because the WebSocket callback is synchronous (`_handle_message` is called within the async loop but is not itself `async`).
-
 ---
 
 ### `BinanceWebSocketService` — Real-time price ingestion
 
-Connects to the Binance combined stream endpoint:
-```
-wss://data-stream.binance.vision/stream?streams=btcusdt@ticker/ethusdt@ticker/solusdt@ticker
-```
+Connects to the Binance combined stream endpoint. The URL is built from `settings.tracked_symbols` at connection time (not on init), so reconnects after a symbol change use the new symbol list.
 
-The URL is built from `settings.tracked_symbols` at construction time. Each message is a combined-stream envelope:
-```json
-{ "stream": "btcusdt@ticker", "data": { "s": "BTCUSDT", "c": "67423.01", ... } }
-```
+When `PUT /api/bot/config` receives a new `tracked_symbols` value, it calls `asyncio.create_task(ws_service.reconnect())` which closes the active WebSocket and triggers immediate reconnect.
 
-For each message:
-1. Parse JSON, extract `data` sub-object
-2. Update `MarketStateStore` with parsed `Decimal` values
-3. Call `risk_service.check_exit_conditions(symbol, last_price)`
-4. If an exit is triggered (stop-loss or take-profit), push the SELL order onto `trigger_queue`
-
-The `run_forever()` method wraps the WebSocket connection in `while True` with a 5-second reconnect delay on any exception.
+On connect/disconnect, `db_logger.log_info` / `log_warning` events are written to `system_logs`.
 
 ---
 
 ### `TriggerExecutor` — Real-time exit processor
 
-Drains `trigger_queue` in an async loop. Each dequeued order is dispatched to the default thread pool executor via `loop.run_in_executor(None, self._execute, order)`. This keeps the WebSocket message loop unblocked even if the execution involves a synchronous HTTP call (ccxt in live mode).
-
-The `_execute` method:
-1. Retrieves the current balance (paper stub or ccxt)
-2. Builds a single-asset `market_data` dict using `trigger_price` as `last_price`
-3. Calls `execution_service.execute_decision(order, market_data, balance)`
-4. Logs the result at `WARNING` level
+Drains `trigger_queue` in an async loop. Each dequeued order is dispatched to the default thread pool executor via `loop.run_in_executor()`, keeping the WebSocket message loop unblocked.
 
 ---
 
-### `TradingCycleService` — Hourly orchestrator
+### `TradingCycleService` — Scheduled orchestrator
 
-The synchronous `run(db: Session)` method is called by APScheduler from a thread pool worker. It is **not** an async function — APScheduler's `AsyncIOScheduler` runs jobs via `asyncio.get_event_loop().run_in_executor()` by default for sync callables.
+The synchronous `run(db)` method is called by APScheduler from a thread pool worker. Steps:
 
-Steps in `run()`:
-1. Call `_build_market_data()` to convert `MarketStateStore` state to the market-data dict
-2. If no data (WebSocket not ready), log and return early
-3. Call `_fetch_sentiment(symbols)` — wraps `get_all_sentiment()` with exception isolation
-4. Call `_fetch_decisions(market_data, sentiment_data, symbols)` — wraps `get_trading_decisions()` with HOLD fallback
+1. Build `market_data` from `MarketStateStore`
+2. Call `_enrich_and_store_ohlcv()` — fetches real OHLCV candles via ccxt using `settings.ohlcv_interval`, upserts to `ohlcv_candles` table, attaches candle list to market data dict
+3. Call `_fetch_sentiment(symbols)` — reads from TTL cache or fetches concurrently
+4. Call `_fetch_decisions(market_data, sentiment_data, symbols)`:
+   - Attempts `ai_service.get_trading_decisions()` (Claude API)
+   - On failure, falls back to `fallback_strategy.get_fallback_decisions()` — SMA-based rule engine
+   - Logs AI failure and fallback activation to `system_logs`
 5. Call `risk_service.filter_decisions(decisions, market_data)`
-6. Call `_fetch_balance()` — paper stub or ccxt
-7. For each filtered decision, call `_persist_cycle(db, ...)` inside a try/except that rolls back on integrity errors
+6. For each decision, execute and persist — `decision_source` ("ai" or "fallback_rule") is stored in `ai_decisions` table
+7. Log `cycle_start` / `cycle_end` events to `system_logs` with `cycle_id` timestamp
 
 ---
 
 ### `AIService` — Claude decision engine
 
-Stateless module-level functions. Uses a lazy-initialized `anthropic.Anthropic` singleton client (created on first call to `_get_client()`).
+Stateless module-level functions. Uses a lazy-initialized `anthropic.Anthropic` singleton.
 
-The system prompt constrains Claude to return **only** a JSON array with a fixed schema. The user prompt is a plaintext block with one section per symbol containing price, 24h range, volume, sentiment score, Fear & Greed Index, and up to 3 top headlines.
+**Dynamic system prompt:** `_build_system_prompt()` reads `settings.min_confidence` and `settings.max_position_pct` at call time — no hardcoded thresholds.
 
-Response processing:
-1. Strip markdown fences (```` ``` ````) if present
-2. Extract the JSON array using a regex (`\[.*\]` with `DOTALL`)
-3. Parse with `json.loads()`
-4. Validate each item against the required field set
-5. Enforce confidence threshold and size caps
-6. Fill in `HOLD` defaults for any symbols missing from the response
+**Prompt inputs per symbol:**
+- Live price, bid, ask
+- `high_period` / `low_period` / `avg_volume_period` / `price_change_pct_period` — stats computed from the OHLCV candle window (labeled by interval, e.g. "24h High")
+- Last 6 hourly closes as a trend line
+- Sentiment score, Fear & Greed index, up to 3 sanitized headlines
+- Current position state (flat vs open with P&L) — constrains valid actions
+- Previous cycle's decision (action + confidence + reasoning) — for continuity
+
+**`_validate_decisions`** adds `"decision_source": "ai"` to all validated items.
+
+---
+
+### `FallbackStrategy` — Rule-based decisions
+
+`get_fallback_decisions(market_data, open_positions)` is called when the Claude API fails. It produces a complete decision list for all symbols using the OHLCV candles attached to `market_data`.
+
+Logic per symbol:
+- Requires ≥ 10 candles (HOLD if fewer)
+- Entry signal: `price > SMA5 > SMA10`, bullish last candle, 3-candle return > 1.5%
+- Exit signal: `price < SMA5`, bearish last candle, 3-candle return < -1.5%
+- Volatility guard: HOLD if 5-candle range > 5%
+- Default position size: 10%
+
+All fallback decisions carry `decision_source: "fallback_rule"`.
 
 ---
 
 ### `RiskService` — Risk enforcement
 
-Maintains `_positions: dict[str, OpenPosition]` in memory. Each `OpenPosition` holds `asset`, `entry_price`, `size_pct`, and `current_price`.
+Maintains `_positions: dict[str, OpenPosition]` in memory. Restored from DB on startup.
 
-Risk checks are performed in two contexts:
-- **Hourly cycle**: `filter_decisions()` calls `check_stop_losses()` for existing positions, then `evaluate_decision()` for each AI decision
-- **Real-time (every tick)**: `check_exit_conditions()` is called directly by the WebSocket handler
-
-When a stop-loss or take-profit triggers in `check_exit_conditions()`, the position is **deleted immediately** from `_positions` before returning the SELL order. This prevents re-triggering on the next tick while the order is still in the queue.
-
-The kill switch is implemented as `os.getenv("KILL_SWITCH", "false").lower() == "true"` evaluated at call time. No restart needed to activate it.
+Risk checks in two contexts:
+- **Cycle**: `filter_decisions()` — kill switch, double-entry guard, phantom-sell guard, confidence threshold, size cap, exposure cap
+- **Real-time tick**: `check_exit_conditions()` — stop-loss and take-profit, position deleted immediately on trigger
 
 ---
 
 ### `ExecutionService` — Order placement
 
-Handles both paper and live execution paths.
+**Paper mode:**
+- BUY fills at `ask` price; SELL fills at `bid` price (fallback to `last_price`)
+- `validate_and_normalize_qty()` called before execution; rejects if below minimum
+- `fee_amount = qty × fill_price × taker_fee_rate` recorded and deducted from paper balance
+- `fill_source` and `fee_rate` stored in order dict and `executions` table
 
-**Paper mode** (`PAPER_TRADING=true`):
-- Computes `qty = portfolio_usdt * (size_pct / 100) / price`
-- Builds a synthetic order dict with `id = "PAPER-{timestamp}"`
-- Updates `RiskService` position tracking
-- Logs to `logs/trades.jsonl`
-
-**Live mode** (`PAPER_TRADING=false`):
-- Converts symbol: `BTCUSDT` → `BTC/USDT`
-- Calls `get_exchange().create_market_order(symbol, side, qty)`
-- Uses `order["average"]` as the filled price for position tracking
-- Logs the raw ccxt order response to `logs/trades.jsonl`
-
-In both modes, all records (including HOLDs) are appended to `logs/trades.jsonl` as newline-delimited JSON.
+**Live mode:**
+- Validates qty via `market_validator`
+- Places market order via ccxt
+- Waits 1s, fetches order back to verify fill
+- `verification_status` recorded: "filled", "partial_or_open", or "verification_failed"
 
 ---
 
 ### `SentimentService` — Market sentiment
 
-Three data sources, all producing scores in `[-1.0, 1.0]`:
+Three data sources (RSS, Reddit, Fear & Greed). TTL-cached per asset (30-minute default).
 
-| Source | Method | Weighting |
-|---|---|---|
-| RSS headlines | TextBlob polarity on `title + summary` for matching entries | Simple mean |
-| Reddit posts | Upvote-weighted TextBlob polarity on post titles | Upvote-weighted mean |
-| Fear & Greed Index | `(value - 50) / 50.0` | Equal weight with others |
+- `_sentiment_cache[symbol]` — `(timestamp, AssetSentiment)` tuple; stale if age > TTL
+- `_fear_greed_cache` — global, 30-minute TTL
+- `_sanitize(text)` — strips HTML, markdown, URLs; caps at 200 characters
+- Concurrent fetch via `ThreadPoolExecutor(2)` per asset, `ThreadPoolExecutor(4)` across assets
+- `clear_sentiment_cache()` for testing
 
-Final score = simple mean of the three source scores, clamped to `[-1, 1]`.
+---
 
-The Fear & Greed Index is fetched once per cycle and shared across all symbols (it is a global market indicator, not asset-specific). RSS and Reddit are fetched per-asset using keyword matching (`BTCUSDT` → `["bitcoin", "btc"]`).
+### `MarketValidator` — Order size validation
+
+`validate_and_normalize_qty(symbol, qty, price)` → `(normalized_qty, error_msg or None)`:
+- Fetches market info from ccxt (cached in `_market_cache`)
+- Validates: `qty >= min_amount`, `qty <= max_amount`, `qty × price >= min_cost`
+- Normalizes qty to `amount_precision` decimal places
+- Returns `(qty, None)` if no market info available (permissive)
+
+---
+
+### `DbLogger` — Structured event logging
+
+Module-level functions: `log_event()`, `log_info()`, `log_warning()`, `log_error()`.
+
+Each call opens its own `SessionLocal()` session and commits independently. This ensures log entries persist even when the caller's main transaction rolls back (e.g. on `IntegrityError` for duplicate snapshots).
+
+Events written to `system_logs`:
+- `server_start` — on application startup
+- `ws_connected` / `ws_disconnected` / `ws_error` — WebSocket lifecycle
+- `bot_start` / `bot_stop` — scheduler control
+- `cycle_start` / `cycle_end` — per trading cycle
+- `ai_request` / `ai_request_failed` / `fallback_activated` — AI layer
+- `order_placed` / `fill_price_fallback` — execution layer
+- `reconciliation_*` — startup live-mode reconciliation
 
 ---
 
 ### `DataFeeds` — ccxt market data
 
-Module-level lazy singleton `ccxt.binance` exchange instance. Created on first call to `get_exchange()`.
-
-In paper trading mode (no `BINANCE_API_KEY`), `fetch_balance()` returns a static dict using `PAPER_BALANCE_USDT` from settings. This means `get_exchange()` is still constructed (for public market data access) but without API credentials.
-
-`get_all_market_data()` is marked as a fallback in comments — the primary price source is the WebSocket, not ccxt REST. ccxt REST is only used for `fetch_balance()` in live mode.
+Module-level lazy singleton `ccxt.binance` exchange instance. Used for:
+- `fetch_ohlcv(symbol, interval, limit)` — real candle data for the trading cycle
+- `fetch_balance()` — live USDT balance; paper stub when no API key is set
+- `GET /chart/history` — historical chart data
 
 ---
 
@@ -233,92 +250,64 @@ In paper trading mode (no `BINANCE_API_KEY`), `fetch_balance()` returns a static
 main.py
   ├── MarketStateStore          (no deps)
   ├── RiskService               (reads settings directly)
-  ├── ExecutionService          ← RiskService
-  ├── TradingCycleService       ← MarketStateStore, RiskService, ExecutionService
-  ├── BinanceWebSocketService   ← MarketStateStore, RiskService, trigger_queue
+  ├── ExecutionService          ← RiskService, MarketValidator, DbLogger
+  ├── TradingCycleService       ← MarketStateStore, RiskService, ExecutionService,
+  │                                AIService, FallbackStrategy, SentimentService,
+  │                                DataFeeds, DbLogger
+  ├── BinanceWebSocketService   ← MarketStateStore, RiskService, trigger_queue, DbLogger
   └── TriggerExecutor           ← trigger_queue, ExecutionService
 
 TradingCycleService.run()
-  ├── ai_service.get_trading_decisions()     (← anthropic SDK, settings)
-  ├── sentiment_service.get_all_sentiment()  (← feedparser, requests, TextBlob)
-  ├── data_feeds.fetch_balance()             (← ccxt or paper stub)
-  └── SQLAlchemy Session                     (← SQLite file)
+  ├── data_feeds.fetch_ohlcv()              (← ccxt, settings.ohlcv_interval)
+  ├── sentiment_service.get_all_sentiment() (← feedparser, requests, TextBlob, TTL cache)
+  ├── ai_service.get_trading_decisions()    (← anthropic SDK, settings)
+  ├── fallback_strategy.get_fallback_decisions()  (← pure Python, OHLCV candles)
+  ├── data_feeds.fetch_balance()            (← ccxt or paper stub)
+  ├── market_validator.validate_and_normalize_qty() (← ccxt market info, cache)
+  ├── db_logger.log_info/warning/error()    (← separate SQLAlchemy session per call)
+  └── SQLAlchemy Session                    (← SQLite file)
 ```
-
----
 
 ---
 
 ## Dashboard (Next.js Frontend)
 
-The dashboard is a **Next.js App Router** application in the `dashboard/` directory. It communicates with the FastAPI backend via REST (`/api/...` proxied by Next.js) and displays real-time data via a 30-second auto-refresh and WebSocket streaming for the candlestick chart.
+The dashboard is a **Next.js App Router** application in `dashboard/`. It communicates with the FastAPI backend via REST (`/api/...` proxied by Next.js) and streams real-time chart data via WebSocket.
+
+### Pages
+
+- **Overview** (`/`) — bot controls, stat cards, candlestick chart, decisions table
+- **Settings** (`/settings`) — config editor; fields locked while bot is running
+- **Logs** (`/logs`) — structured event log viewer; filterable, paginated
 
 ### Key components
 
-**`app/layout.tsx`** — Root layout. Wraps the entire app in `ThemeProvider` (dark/light mode) and `DisplayPrefsProvider` (global display preferences).
+**`app-sidebar.tsx`** — nav links (Overview, Settings, Logs), bot status badge, live clock, theme toggle.
 
-**`app/providers/display-prefs-provider.tsx`** — React Context that exposes:
-- `prefs` — current display preferences (timezone, currency)
-- `cvtPrice(usd)` — converts a USD amount to the display currency using exchange rates
-- `currencySymbol` — the symbol for the active currency (e.g. `£`)
-- `fmtTime(iso)` — formats a UTC ISO timestamp in the user's selected timezone via `Intl`
+**`mobile-nav.tsx`** — mobile slide-in drawer with the same nav links.
 
-Preferences are persisted to `localStorage` and loaded on mount to avoid SSR hydration mismatches.
+**`candlestick-chart.tsx`** — TradingView Lightweight Charts. Live price, entry, SL, and TP price lines with toggles.
 
-**`app/components/dashboard.tsx`** — Main overview page. Fetches from `/api/status`, `/api/config`, `/api/decisions`, `/api/positions`, and `/api/assets`. Uses `fmtTime` and `cvtPrice` from the display prefs context for all visible timestamps and monetary values.
-
-**`app/components/candlestick-chart.tsx`** — Lightweight-charts candlestick chart with:
-- `autoSize: true` — chart fills its container width automatically; no manual `ResizeObserver` required
-- Real-time data from Binance WebSocket (via backend streaming); `timeScale().fitContent()` called after each history load
-- Three price lines: Entry (yellow `#eab308`, dotted), Stop Loss (red, dashed), Take Profit (green, dashed)
-- Toggle buttons for each price line
-- `autoscaleInfoProvider` that expands the chart's visible range to always include SL/TP levels
-- Position info row: entry price, SL with % distance, TP with % distance, R/R ratio
-- Timezone-aware time axis via `chart.applyOptions({ localization: { timeFormatter } })`
-
-**`app/settings/page.tsx`** — Flat two-column layout with a single SaveBar:
-- **AI Model** column — `model_name`, `interval_minutes`, `min_confidence`
-- **Trading** column — `tracked_symbols`, position sizing, risk parameters, paper balance
-- **Display** row (full width) — `chart_interval`, `display_currency`, `timezone`
-- Bot running: AI Model and Trading fields locked (disabled + lock icon on heading); only Display fields editable. Save sends display values merged onto last saved config.
-- Bot stopped: all fields editable; Save sends full config.
-
-**`lib/display-prefs.ts`** — Display preference types, currency/timezone lists, exchange rates, localStorage helpers.
+**`providers/display-prefs-provider.tsx`** — global timezone/currency context; `fmtTime(iso)` corrects SQLite naive timestamps for display.
 
 ### Display preferences system
 
-**Currency.** The backend always operates in USDT and raw crypto quantities. Every monetary value returned by the API — `wallet_balance`, `entry_price`, `execution_price`, `unrealized_pnl` — is in USD (USDT). No currency conversion occurs server-side. The display currency and its symbol are applied in the browser by `cvtPrice(usd)` from `DisplayPrefsProvider`:
-
-```
-Backend:   wallet_balance = 10000.0  (USDT)
-Browser:   cvtPrice(10000.0) → 7900.0   currencySymbol → '£'
-UI shows:  £7,900.00
-```
-
-Exchange rates are hardcoded constants in `lib/display-prefs.ts` — there is no live FX feed.
-
-**Timezone.** All timestamps stored in the database are produced by Python's `datetime.utcnow()`. SQLite persists these as ISO 8601 strings **without a timezone suffix** (e.g. `"2026-04-23T01:34:00"`). JavaScript's `Date` constructor interprets bare ISO strings as *local time* per spec, not UTC — this produces a wrong result on any machine not in the UTC timezone.
-
-`fmtTime` in `DisplayPrefsProvider` corrects this by appending `Z` when no timezone designator is present:
-
-```tsx
-// SQLite returns naive ISO strings — JS parses them as local time without this fix.
-const utc = /[Z+]/.test(iso) ? iso : iso + 'Z'
-return new Date(utc).toLocaleString('en', { timeZone: prefs.timezone, ... })
-```
-
-`Z` forces UTC interpretation; `toLocaleString` with the IANA string then converts to the user's chosen timezone. Every component that renders a timestamp calls `fmtTime` — the fix is applied once and propagates to all views.
-
-Changing the display timezone in the dashboard does **not** affect the backend. Python always logs UTC, SQLite always stores naive strings, and the API always returns them unchanged. The `timezone` field in `bot_config` is read by `DisplayPrefsProvider` on load to synchronise preferences across browser sessions; it is never read by any trading service.
+All monetary values from the backend are in USDT. Currency conversion is browser-side via `cvtPrice(usd)`. Exchange rates are hardcoded constants. Timezone is applied by `fmtTime` using `Intl`. Both preferences are persisted to `localStorage`.
 
 ---
 
 ## Design Rationale
 
-**Single process, single event loop** — deployment is one `uvicorn` command, no message queue, no worker processes. Blocking calls in the hourly cycle run in APScheduler's thread pool and do not block the WebSocket loop.
+**Single process, single event loop** — deployment is one `uvicorn` command. Blocking calls in the trading cycle run in APScheduler's thread pool and do not block the WebSocket loop.
 
-**In-memory position tracking** — eliminates DB round-trips on every WebSocket tick. The tradeoff is position state is lost on restart. See [persistence.md](persistence.md).
+**Isolated DB logger sessions** — `db_logger` opens a new `SessionLocal()` per call so log entries always commit, even when the caller's main session rolls back.
 
-**Kill switch as env var read at call time** — lets an operator halt trading without restarting the process. Set `KILL_SWITCH=true` in the environment and it takes effect on the next risk check.
+**TTL sentiment cache** — avoids re-fetching external APIs every cycle. 30-minute TTL is a reasonable balance between freshness and rate-limit safety.
+
+**Rule-based fallback** — SMA crossover is simple, explainable, and conservative. It cannot make the same catastrophic error as a hallucinating LLM.
+
+**Permissive market validator** — if ccxt can't load market info (new symbol, API issue), the order is allowed through. This prefers execution availability over strict validation for the MVP.
+
+**Kill switch as env var read at call time** — lets an operator halt trading without restarting the process.
 
 **Constructor injection** — makes the service graph explicit and unit-testable without mocking module globals.

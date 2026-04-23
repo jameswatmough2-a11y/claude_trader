@@ -39,6 +39,7 @@ class AIDecision(Base):
     recommended_take_profit: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 8), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    decision_source: Mapped[str] = mapped_column(String(20), nullable=False, default="ai")
 
     snapshot: Mapped["HourlyMarketSnapshot"] = relationship(back_populates="ai_decision")
     execution: Mapped[Optional["Execution"]] = relationship(

@@ -1,8 +1,8 @@
 # Claude Trader — Developer Documentation
 
-Claude Trader is a prototype cryptocurrency trading bot. It connects to Binance via a persistent WebSocket for real-time price data, asks Claude AI for hourly trading decisions, applies a layered risk management system, and executes paper or live trades.
+Claude Trader is a cryptocurrency trading bot. It connects to Binance via a persistent WebSocket for real-time price data, fetches real OHLCV candles each cycle, asks Claude AI for trading decisions (falling back to a rule-based strategy when the API is unavailable), applies a layered risk management system, and executes paper or live trades with realistic fee modeling.
 
-**Status:** prototype / paper trading by default. No real orders are placed unless you supply Binance API keys and explicitly set `PAPER_TRADING=false`.
+**Status:** MVP — paper trading by default. No real orders are placed unless you supply Binance API keys and explicitly set `PAPER_TRADING=false`.
 
 ---
 
@@ -10,17 +10,18 @@ Claude Trader is a prototype cryptocurrency trading bot. It connects to Binance 
 
 | File | What it covers |
 |---|---|
-| [architecture.md](architecture.md) | System layers, component map, dependency graph |
-| [workflow.md](workflow.md) | Step-by-step runtime: startup, continuous operation, hourly cycle |
+| [mvp_summary.md](mvp_summary.md) | **Start here** — what works, what's simplified, recommended next steps |
+| [architecture.md](architecture.md) | System layers, component map, service wiring, dependency graph |
+| [workflow.md](workflow.md) | Step-by-step runtime: startup, continuous operation, trading cycle |
 | [services.md](services.md) | Deep dive into every service: inputs, outputs, logic, edge cases |
-| [trading_logic.md](trading_logic.md) | AI prompt design, risk rules, execution sizing |
+| [trading_logic.md](trading_logic.md) | AI prompt design, risk rules, fallback strategy, execution sizing |
 | [data_flow.md](data_flow.md) | How data moves from WebSocket tick to database record |
 | [configuration.md](configuration.md) | Every environment variable, defaults, and behavioral impact |
-| [api.md](api.md) | REST endpoints + WebSocket protocol with example payloads |
-| [dashboard.md](dashboard.md) | Next.js dashboard — component map, WS hook, chart architecture |
-| [persistence.md](persistence.md) | ORM models, what lives in the DB vs. in memory, restart behavior |
+| [api.md](api.md) | REST endpoints (including `/logs`) + WebSocket protocol with payloads |
+| [dashboard.md](dashboard.md) | Next.js dashboard — pages (Overview, Settings, Logs), chart, WS hook |
+| [persistence.md](persistence.md) | ORM models (all 7 tables), what lives in DB vs. memory, restart behavior |
 | [concurrency.md](concurrency.md) | Async architecture, two concurrent loops, race condition handling |
-| [limitations.md](limitations.md) | Prototype constraints, things that would break in production |
+| [limitations.md](limitations.md) | What's resolved, what remains open, production gaps |
 | [upgrade_guide.md](upgrade_guide.md) | How to extend the system: new assets, exchanges, AI providers |
 
 ---
@@ -131,16 +132,19 @@ claude_trader/
 │   │   ├── models/                  # SQLAlchemy ORM models
 │   │   │   ├── asset.py
 │   │   │   ├── hourly_market_snapshot.py
+│   │   │   ├── ohlcv_candle.py      # Real OHLCV candle storage
 │   │   │   ├── position.py
-│   │   │   ├── ai_decision.py
-│   │   │   └── execution.py
+│   │   │   ├── ai_decision.py       # Includes decision_source field
+│   │   │   ├── execution.py         # Includes fee_rate, fill_source, verification_status
+│   │   │   └── system_log.py        # Structured event log
 │   │   ├── api/
 │   │   │   ├── deps.py              # get_db dependency
 │   │   │   └── routes/              # REST + WebSocket endpoints
-│   │   │       ├── health.py        # GET /health
+│   │   │       ├── health.py        # GET /health  (extended diagnostics)
 │   │   │       ├── assets.py        # GET /assets
 │   │   │       ├── positions.py     # GET /positions
 │   │   │       ├── decisions.py     # GET /decisions
+│   │   │       ├── logs.py          # GET /logs  (paginated, filterable)
 │   │   │       ├── market.py        # GET /market  (live prices from WS cache)
 │   │   │       └── chart.py         # GET /chart/history + WS /ws/chart
 │   │   └── services/
@@ -148,19 +152,26 @@ claude_trader/
 │   │       ├── binance_ws.py        # Persistent WebSocket + real-time exit checks
 │   │       ├── trigger_executor.py  # Async queue consumer for stop-loss / take-profit
 │   │       ├── data_feeds.py        # ccxt exchange factory + OHLCV fetcher
-│   │       ├── sentiment_service.py # RSS + Reddit + Fear & Greed sentiment scoring
+│   │       ├── sentiment_service.py # RSS + Reddit + Fear & Greed (TTL cached, concurrent)
 │   │       ├── ai_service.py        # Claude API call + prompt + response validation
+│   │       ├── fallback_strategy.py # SMA-based rule engine (AI fallback)
+│   │       ├── market_validator.py  # Min order size + precision validation
+│   │       ├── db_logger.py         # Structured event logging to system_logs
 │   │       ├── risk_service.py      # Position tracking + risk rule enforcement
-│   │       ├── execution_service.py # Paper / live order placement
-│   │       └── trading_cycle.py     # Hourly orchestrator
+│   │       ├── execution_service.py # Paper / live order placement (bid/ask fills, fees)
+│   │       └── trading_cycle.py     # Scheduled orchestrator (OHLCV + AI/fallback + persist)
 │   ├── .env.example
 │   └── requirements.txt
 ├── dashboard/                       # Next.js monitoring UI
 │   ├── app/
 │   │   ├── layout.tsx               # Root layout — sidebar shell + ThemeProvider
-│   │   ├── page.tsx                 # Overview page (Dashboard + CandlestickChart)
+│   │   ├── page.tsx                 # Redirect → /overview
+│   │   ├── overview/page.tsx        # Overview (Dashboard + CandlestickChart)
+│   │   ├── settings/page.tsx        # Config editor
+│   │   ├── logs/page.tsx            # Structured event log viewer
 │   │   └── components/
-│   │       ├── app-sidebar.tsx      # Sidebar: brand, nav, bot status
+│   │       ├── app-sidebar.tsx      # Sidebar: brand, nav (Overview/Settings/Logs), status
+│   │       ├── mobile-nav.tsx       # Mobile slide-in drawer
 │   │       ├── dashboard.tsx        # Stats, decisions table, positions, assets
 │   │       └── candlestick-chart.tsx# TradingView live candlestick chart
 │   ├── hooks/

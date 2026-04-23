@@ -45,10 +45,12 @@ class BinanceWebSocketService:
                 pass
 
     async def run_forever(self) -> None:
+        from app.services import db_logger
         while True:
             try:
                 url = self._build_url()
                 logger.info("Connecting Binance WebSocket: %s", url)
+                db_logger.log_info("websocket", "ws_connect", f"Connecting to Binance WebSocket: {url}")
                 async with connect(url, ping_interval=20, ping_timeout=60) as ws:
                     self._ws = ws
                     async for message in ws:
@@ -57,6 +59,10 @@ class BinanceWebSocketService:
                 raise
             except Exception as exc:
                 logger.exception("Binance WebSocket error — reconnecting in 5s: %s", exc)
+                db_logger.log_warning(
+                    "websocket", "ws_disconnect",
+                    f"WebSocket disconnected — reconnecting in 5s: {exc!s:.200}",
+                )
                 await asyncio.sleep(5)
             finally:
                 self._ws = None
