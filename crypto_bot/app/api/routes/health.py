@@ -41,16 +41,8 @@ def health(db: Session = Depends(get_db)) -> dict:
     last_ai_failure = last_ai_fail.created_at.isoformat() if last_ai_fail else None
 
     # Sentiment cache status
-    from app.services.sentiment_service import _sentiment_cache
-    import time
-    sentiment_status = {
-        s: {
-            "cached": True,
-            "age_seconds": round(time.time() - ts),
-        }
-        for s, (ts, _) in _sentiment_cache.items()
-        if _ is not None
-    }
+    from app.services.sentiment_service import get_sentiment_cache_status
+    sentiment_status = get_sentiment_cache_status()
 
     return {
         "status": "ok",

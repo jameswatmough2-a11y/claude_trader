@@ -41,7 +41,7 @@ The app uses a persistent sidebar layout defined in `app/layout.tsx`:
 │          │  Overview:   Bot controls, stats, chart, tables │
 │ · Brand  │  Settings:   Config editor                      │
 │ · Nav    │  Logs:       Filtered event log viewer          │
-│ · Status │                                                  │
+│ · Status │  Sessions:   Session browser + detail           │
 │          │                                                  │
 └──────────┴──────────────────────────────────────────────────┘
 ```
@@ -59,11 +59,14 @@ app/
   overview/page.tsx           # Composes Dashboard + CandlestickChart
   settings/page.tsx           # Settings page (config editor)
   logs/page.tsx               # Logs page (event log viewer)
+  sessions/
+    page.tsx                  # Sessions browser (paginated table)
+    [id]/page.tsx             # Session detail (stat cards + trades table)
   components/
-    app-sidebar.tsx           # Sidebar: brand, nav (Overview/Settings/Logs), bot status, clock
+    app-sidebar.tsx           # Sidebar: brand, nav (Overview/Settings/Logs/Sessions), bot status, clock
     mobile-nav.tsx            # Mobile top-bar + slide-in drawer (md:hidden)
-    dashboard.tsx             # Stats cards, decisions table, positions, assets
-    candlestick-chart.tsx     # TradingView candlestick chart (live + historical)
+    dashboard.tsx             # Stats cards (incl. session P&L), decisions table, positions, assets
+    candlestick-chart.tsx     # TradingView candlestick chart (live, markers, trade highlights)
   providers/
     display-prefs-provider.tsx # Global timezone/currency context
 hooks/
@@ -80,8 +83,11 @@ lib/
 
 All REST calls go through Next.js rewrites in `next.config.mjs`:
 ```
-Browser → /api/bot/*   → http://localhost:8000/*
-Browser → /api/chart/* → http://localhost:8000/chart/*
+Browser → /api/bot/*      → http://localhost:8000/*
+Browser → /api/chart/*    → http://localhost:8000/chart/*
+Browser → /api/logs/*     → http://localhost:8000/logs/*
+Browser → /api/sessions/* → http://localhost:8000/sessions/*
+Browser → /api/trades/*   → http://localhost:8000/trades/*
 ```
 
 The WebSocket connects directly from the browser to the backend:
@@ -97,7 +103,19 @@ Override with `NEXT_PUBLIC_WS_URL` for remote deployments.
 
 ### Overview (`/`)
 
-Bot controls (Start / Stop / Reset DB), stat cards, live candlestick chart, AI decisions table, positions and assets tables.
+Bot controls (Start / Stop / Reset DB), stat cards (including live session P&L card showing live P&L, win rate, and trade count), live candlestick chart with trade markers, AI decisions table, positions and assets tables.
+
+The session P&L card polls `GET /api/sessions/current` every 30 s (same cadence as the main health poll) and shows live unrealized P&L in green/red.
+
+### Sessions (`/sessions`)
+
+Paginated table of all bot sessions. Columns: ID, started (timezone-aware), duration, status badge, P&L (green/red with TrendingUp/Down icon), trades count, win rate, fees. Clicking a row navigates to `/sessions/[id]`.
+
+### Session Detail (`/sessions/[id]`)
+
+Stat card row: Started, Duration, P&L, Trades, Wins/Losses, Win Rate, Fees.
+
+Below that: a trades table with color-coded rows (light green background = winning trade, light red = losing trade). Columns: Symbol, Entry, Exit, Qty, SL, TP, P&L (USDT + %), Exit Reason, Opened, Closed, Status.
 
 ### Settings (`/settings`)
 
@@ -157,6 +175,8 @@ Structured event log viewer backed by `GET /logs` from the backend.
 
 **Refresh button:** re-fetches current filter results.
 
+**Auto-refresh:** `setInterval` at 15 s. A `fetchingRef` guard prevents concurrent fetches if the previous request is still pending.
+
 ---
 
 ## Candlestick Chart (`candlestick-chart.tsx`)
@@ -165,9 +185,10 @@ Built on TradingView Lightweight Charts v5.
 
 **No rerender per tick.** Chart instance stored in `useRef`, not state. WebSocket updates call `series.update()` directly.
 
-**Two data sources:**
+**Three data sources:**
 - REST `GET /api/chart/history` — historical OHLCV on mount and symbol/interval change
 - WebSocket `ws://localhost:8000/ws/chart` — live candle stream at ~5 Hz
+- REST `GET /api/sessions/current/markers` — trade markers and range highlights fetched after history loads
 
 **Price lines when a position is open:**
 
@@ -177,6 +198,10 @@ Built on TradingView Lightweight Charts v5.
 | Entry | Slate `#94a3b8` | Dotted |
 | Stop loss | Red `#ef4444` | Dashed |
 | Take profit | Green `#22c55e` | Dashed |
+
+**Trade markers:** `series.setMarkers()` is called with BUY markers (green `arrowUp` below bar) and SELL markers (red `arrowDown` above bar) returned by the markers endpoint. Timestamps are aligned to candle boundaries by the backend.
+
+**Trade range highlights:** Absolutely-positioned `<div>` overlays on the chart container, positioned using `chart.timeScale().timeToCoordinate()`. Color: teal tint for winning trades, red tint for losing trades, grey for open trades. Redrawn on `subscribeVisibleLogicalRangeChange` to stay aligned on pan/zoom.
 
 **Toggle pattern:** `showRef` (ref) updated synchronously in `toggleLine()` so stable `useCallback` handlers read the current value immediately; `show` (state) triggers re-render + `useEffect` that redraws position lines.
 
@@ -201,9 +226,9 @@ Polls `GET /api/bot/health` every 30 seconds. Displays:
 - Tracked symbols as `Badge` components
 - Live clock — second-accurate, synced to next exact second boundary; displayed in the user's selected timezone
 
-Navigation links: **Overview**, **Settings**, **Logs** (with `ScrollText` icon).
+Navigation links: **Overview**, **Settings**, **Logs** (ScrollText icon), **Sessions** (History icon).
 
-On mobile (`md:hidden`) the sidebar is replaced by `MobileNav` with the same three nav links in a slide-in drawer.
+On mobile (`md:hidden`) the sidebar is replaced by `MobileNav` with the same four nav links in a slide-in drawer.
 
 ---
 
@@ -211,9 +236,9 @@ On mobile (`md:hidden`) the sidebar is replaced by `MobileNav` with the same thr
 
 On the Overview page:
 
-- **Start** — fires one cycle immediately, then runs on the configured interval
-- **Stop** — pauses scheduler; positions stay open, stop-loss continues on restart
-- **Reset DB** — drops and recreates all tables; disabled while the bot is running
+- **Start** — creates a `TradingSession`, fires one cycle immediately, then runs on the configured interval
+- **Stop** — closes open trades at current market price, closes the session, pauses scheduler
+- **Reset DB** — clears all trading data (trades, sessions, decisions, executions, snapshots, assets, logs); disabled while a cycle is active
 
 ---
 

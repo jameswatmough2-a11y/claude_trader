@@ -67,6 +67,7 @@ export default function LogsPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
+  const fetchingRef = useRef(false)
 
   // Filters
   const [level, setLevel] = useState('')
@@ -81,6 +82,8 @@ export default function LogsPage() {
   const [eventTypes, setEventTypes] = useState<string[]>([])
 
   const fetchLogs = useCallback(async () => {
+    if (fetchingRef.current) return
+    fetchingRef.current = true
     setLoading(true)
     setError(null)
     try {
@@ -99,6 +102,7 @@ export default function LogsPage() {
       setError(e instanceof Error ? e.message : 'Failed to fetch logs')
     } finally {
       setLoading(false)
+      fetchingRef.current = false
     }
   }, [page, level, component, symbol, eventType])
 

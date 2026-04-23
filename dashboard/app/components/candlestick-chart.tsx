@@ -8,10 +8,13 @@ import {
   IChartApi,
   IPriceLine,
   ISeriesApi,
+  ISeriesMarkersPluginApi,
   LineStyle,
+  SeriesMarker,
   Time,
   UTCTimestamp,
   createChart,
+  createSeriesMarkers,
 } from 'lightweight-charts'
 
 import { Badge } from '@/components/ui/badge'
@@ -118,6 +121,14 @@ export function CandlestickChart({
   const plRef = useRef<Record<LineKey, IPriceLine | null>>({ entry: null, sl: null, tp: null })
   const positionRef = useRef<WsPosition | null>(null)
 
+  // Trade markers
+  const markersPluginRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null)
+  const tradeRangesRef = useRef<Array<{
+    trade_id: number; entry_time: number; exit_time: number | null;
+    pnl_pct: number | null; status: string
+  }>>([])
+  const highlightDivsRef = useRef<HTMLDivElement[]>([])
+
   // Update chart localization when timezone changes
   useEffect(() => {
     chartRef.current?.applyOptions({
@@ -181,8 +192,9 @@ export function CandlestickChart({
         const pos = positionRef.current
         if (!pos) return res
 
-        const prices = [pos.entry_price, pos.stop_loss_price]
-        if (pos.take_profit_price != null) prices.push(pos.take_profit_price)
+        const prices: number[] = [pos.entry_price]
+        if (pos.stop_loss_price != null && pos.stop_loss_price > 0) prices.push(pos.stop_loss_price)
+        if (pos.take_profit_price != null && pos.take_profit_price > 0) prices.push(pos.take_profit_price)
 
         const posMin = Math.min(...prices)
         const posMax = Math.max(...prices)
@@ -200,13 +212,58 @@ export function CandlestickChart({
       },
     })
     seriesRef.current = series
+    markersPluginRef.current = createSeriesMarkers(series, [])
 
     return () => {
       chart.remove()
       chartRef.current = null
       seriesRef.current = null
+      markersPluginRef.current = null
     }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Draw trade range highlights ──────────────────────────────────────────────
+
+  const drawTradeHighlights = useCallback(() => {
+    const chart = chartRef.current
+    const container = containerRef.current
+    if (!chart || !container) return
+
+    // Remove old overlays
+    highlightDivsRef.current.forEach(d => d.remove())
+    highlightDivsRef.current = []
+
+    const ts = chart.timeScale()
+    tradeRangesRef.current.forEach(range => {
+      const x1 = ts.timeToCoordinate(range.entry_time as UTCTimestamp)
+      const x2 = range.exit_time
+        ? ts.timeToCoordinate(range.exit_time as UTCTimestamp)
+        : container.clientWidth
+
+      if (x1 === null || x1 === undefined) return
+
+      const isWin = range.pnl_pct !== null ? range.pnl_pct > 0 : null
+      const color = isWin === null
+        ? 'rgba(148, 163, 184, 0.05)'
+        : isWin
+          ? 'rgba(8, 153, 129, 0.07)'
+          : 'rgba(242, 54, 69, 0.07)'
+
+      const div = document.createElement('div')
+      div.style.cssText = `
+        position: absolute;
+        top: 0; bottom: 0;
+        left: ${x1}px;
+        width: ${Math.max(2, (x2 ?? container.clientWidth) - x1)}px;
+        background: ${color};
+        pointer-events: none;
+        z-index: 0;
+      `
+      container.style.position = 'relative'
+      container.appendChild(div)
+      highlightDivsRef.current.push(div)
+    })
+  }, [])
 
   // ── Load history on symbol / timeframe change ───────────────────────────────
 
@@ -215,15 +272,63 @@ export function CandlestickChart({
     if (!series) return
 
     setLoading(true)
+
+    // Clear old markers and highlights on symbol/timeframe change
+    markersPluginRef.current?.setMarkers([])
+    highlightDivsRef.current.forEach(d => d.remove())
+    highlightDivsRef.current = []
+    tradeRangesRef.current = []
+
     fetch(`/api/chart/history?symbol=${symbol}&interval=${timeframe}`)
       .then(r => r.json())
       .then(({ candles }: { candles: Array<{ time: number; open: number; high: number; low: number; close: number }> }) => {
         series.setData(candles.map(c => ({ ...c, time: c.time as UTCTimestamp })))
         chartRef.current?.timeScale().fitContent()
         setLoading(false)
+
+        // Fetch trade markers for the current session
+        return fetch(`/api/sessions/current/markers?symbol=${symbol}&timeframe=${timeframe}`)
+      })
+      .then(r => (r && r.ok) ? r.json() : null)
+      .then((data: {
+        markers: Array<{
+          time: number; position: string; color: string; shape: string;
+          text: string; action: string; trade_id: number | null
+        }>;
+        trade_ranges: Array<{
+          trade_id: number; entry_time: number; exit_time: number | null;
+          pnl_pct: number | null; status: string
+        }>;
+      } | null) => {
+        if (!data || !markersPluginRef.current) return
+        markersPluginRef.current.setMarkers(
+          data.markers.map(m => ({
+            time: m.time as UTCTimestamp,
+            position: m.position as 'aboveBar' | 'belowBar',
+            color: m.color,
+            shape: m.shape as 'arrowUp' | 'arrowDown' | 'circle',
+            text: m.text,
+          })) as SeriesMarker<Time>[]
+        )
+        tradeRangesRef.current = data.trade_ranges
+        drawTradeHighlights()
       })
       .catch(() => setLoading(false))
-  }, [symbol, timeframe])
+  }, [symbol, timeframe, drawTradeHighlights])
+
+  // Redraw highlights when the chart is scrolled/zoomed
+  useEffect(() => {
+    const chart = chartRef.current
+    if (!chart) return
+    chart.timeScale().subscribeVisibleLogicalRangeChange(drawTradeHighlights)
+    return () => {
+      try {
+        chart.timeScale().unsubscribeVisibleLogicalRangeChange(drawTradeHighlights)
+      } catch {
+        // chart may already be disposed on unmount
+      }
+    }
+  }, [drawTradeHighlights])
 
   // ── Price line management ───────────────────────────────────────────────────
 
@@ -257,7 +362,7 @@ export function CandlestickChart({
         title: 'Entry',
       })
     }
-    if (flags.sl) {
+    if (flags.sl && pos.stop_loss_price != null && pos.stop_loss_price > 0) {
       plRef.current.sl = s.createPriceLine({
         price: pos.stop_loss_price,
         color: '#ef4444',
@@ -309,10 +414,17 @@ export function CandlestickChart({
     drawPositionLines(pos)
   }, [drawPositionLines])
 
+  const handlePositionCleared = useCallback(() => {
+    setPosition(null)
+    positionRef.current = null
+    clearPositionLines()
+  }, [clearPositionLines])
+
   useChartWs(symbol, timeframe, {
     onCandle: handleCandle,
     onPrice: handlePrice,
     onPosition: handlePosition,
+    onPositionCleared: handlePositionCleared,
     onConnected: () => setWsConnected(true),
     onDisconnected: () => setWsConnected(false),
   })
@@ -325,7 +437,7 @@ export function CandlestickChart({
 
   function dp(usd: number) { return fmtPrice(cvtPrice(usd), decimals) }
 
-  const slPct = position
+  const slPct = position && position.stop_loss_price != null && position.stop_loss_price > 0
     ? ((position.entry_price - position.stop_loss_price) / position.entry_price * 100)
     : null
   const tpPct = position?.take_profit_price != null
@@ -413,11 +525,13 @@ export function CandlestickChart({
                 {currencySymbol}{dp(position.entry_price)}
               </span>
             </span>
-            <span className="text-red-400">
-              SL{' '}
-              <span className="font-mono">{currencySymbol}{dp(position.stop_loss_price)}</span>
-              {slPct != null && <span className="ml-1 opacity-60">−{slPct.toFixed(2)}%</span>}
-            </span>
+            {position.stop_loss_price != null && position.stop_loss_price > 0 && (
+              <span className="text-red-400">
+                SL{' '}
+                <span className="font-mono">{currencySymbol}{dp(position.stop_loss_price)}</span>
+                {slPct != null && <span className="ml-1 opacity-60">−{slPct.toFixed(2)}%</span>}
+              </span>
+            )}
             {position.take_profit_price != null && (
               <span className="text-green-400">
                 TP{' '}

@@ -37,10 +37,12 @@ class TradingCycleService:
         self.execution_service = execution_service
 
     def run(self, db: Session) -> None:
+        from app.state import bot_state
         cycle_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         now = datetime.now(timezone.utc)
+        session_id = bot_state.current_session_id
 
-        logger.info("Trading cycle starting (id=%s)", cycle_id)
+        logger.info("Trading cycle starting (id=%s session=%s)", cycle_id, session_id)
         db_logger.log_info("cycle", "cycle_start", f"Trading cycle starting (id={cycle_id})", cycle_id=cycle_id)
 
         market_data = self._build_market_data()
@@ -65,7 +67,7 @@ class TradingCycleService:
             symbol = decision["asset"]
             md = market_data.get(symbol, {})
             try:
-                self._persist_cycle(db, symbol, md, decision, now, cycle_id)
+                self._persist_cycle(db, symbol, md, decision, now, cycle_id, session_id)
             except IntegrityError:
                 db.rollback()
                 logger.warning("Duplicate snapshot for %s at %s — skipping", symbol, now.isoformat())
@@ -303,6 +305,7 @@ class TradingCycleService:
         decision: dict[str, Any],
         now: datetime,
         cycle_id: str,
+        session_id: int | None = None,
     ) -> None:
         balance = self._fetch_balance()
         asset = self._get_or_create_asset(db, symbol)
@@ -319,6 +322,7 @@ class TradingCycleService:
             volume=Decimal(str(md.get("volume_24h", 0) or 0)),
             price_change_1h_pct=None,
             price_change_since_entry_pct=None,
+            session_id=session_id,
         )
         db.add(snapshot)
         db.flush()
@@ -394,8 +398,55 @@ class TradingCycleService:
             verification_status=verification_status,
             execution_time=now if decision["action"] != "HOLD" else None,
             status=exec_status,
+            session_id=session_id,
         )
         db.add(execution)
+        db.flush()
+
+        # ── Trade lifecycle ────────────────────────────────────────────────────
+        if session_id and exec_status in ("filled", "paper_filled"):
+            from app.state import trade_service
+            exec_price = float(execution.execution_price or 0)
+            exec_qty = float(execution.executed_size or 0)
+            exec_fee = float(execution.fees_paid or 0)
+            action = decision["action"]
+
+            if action == "BUY" and exec_price > 0:
+                from app.config import settings as _settings
+                sl = exec_price * (1 - _settings.stop_loss_pct / 100) if _settings.stop_loss_pct > 0 else None
+                tp = exec_price * (1 + _settings.take_profit_pct / 100) if _settings.take_profit_pct > 0 else None
+                trade = trade_service.open_trade(
+                    db, session_id, symbol,
+                    entry_execution_id=execution.id,
+                    entry_price=exec_price,
+                    entry_qty=exec_qty,
+                    entry_fee_usdt=exec_fee,
+                    size_pct=float(decision["size_pct"]),
+                    opened_at=now,
+                    stop_loss_price=sl,
+                    take_profit_price=tp,
+                )
+                execution.trade_id = trade.id
+                self.risk_service.update_position_levels(symbol, sl, tp)
+
+            elif action == "SELL":
+                open_trade = trade_service.get_open_trade_for_symbol(db, session_id, symbol)
+                if open_trade:
+                    exit_reason = decision.get("exit_reason", "ai_sell")
+                    if "stop" in decision.get("reasoning", "").lower():
+                        exit_reason = "stop_loss"
+                    elif "take" in decision.get("reasoning", "").lower() or "profit" in decision.get("reasoning", "").lower():
+                        exit_reason = "take_profit"
+                    trade_service.close_trade(
+                        db, open_trade.id,
+                        exit_execution_id=execution.id,
+                        exit_price=exec_price if exec_price > 0 else float(price),
+                        exit_fee_usdt=exec_fee,
+                        exit_reason=exit_reason,
+                        closed_at=now,
+                    )
+                    execution.trade_id = open_trade.id
+
         db.commit()
 
         if decision["action"] != "HOLD":

@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -19,6 +20,8 @@ from app.services.execution_service import ExecutionService
 from app.services.trading_cycle import TradingCycleService
 from app.services.binance_ws import BinanceWebSocketService
 from app.services.trigger_executor import TriggerExecutor
+from app.services.session_service import SessionService
+from app.services.trade_service import TradeService
 
 logger = logging.getLogger(__name__)
 
@@ -41,13 +44,17 @@ ws_service = BinanceWebSocketService(
 trigger_executor = TriggerExecutor(
     queue=trigger_queue,
     execution_service=execution_service,
+    session_factory=None,  # set after SessionLocal is available in main.py
 )
+session_service = SessionService()
+trade_service = TradeService()
 
 
 @dataclass
 class BotState:
     running: bool = False
-    cycle_active: bool = False  # True while a cycle is mid-execution
+    cycle_active: bool = False
+    current_session_id: Optional[int] = None
 
 
 bot_state = BotState()

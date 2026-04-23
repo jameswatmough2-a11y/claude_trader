@@ -37,6 +37,9 @@ class Execution(Base):
     verification_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
 
     execution_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    status: Mapped[str] = mapped_column(String(20), nullable=False)  # filled, rejected, none
+    status: Mapped[str] = mapped_column(String(20), nullable=False)  # filled, rejected, none, paper_filled
+
+    session_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    trade_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     ai_decision: Mapped["AIDecision"] = relationship(back_populates="execution")

@@ -1,4 +1,7 @@
 from .base import Base
+from .user import User
+from .trading_session import TradingSession
+from .trade import Trade
 from .asset import Asset
 from .hourly_market_snapshot import HourlyMarketSnapshot
 from .position import Position
@@ -10,6 +13,9 @@ from .ohlcv_candle import OhlcvCandle
 
 __all__ = [
     "Base",
+    "User",
+    "TradingSession",
+    "Trade",
     "Asset",
     "HourlyMarketSnapshot",
     "Position",

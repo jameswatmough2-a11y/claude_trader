@@ -23,6 +23,8 @@ class OpenPosition:
     entry_price: float
     size_pct: float
     current_price: float = 0.0
+    stop_loss_price: Optional[float] = None
+    take_profit_price: Optional[float] = None
 
 
 @dataclass
@@ -40,15 +42,35 @@ class RiskService:
 
     # ── Position state ─────────────────────────────────────────────────────────
 
-    def record_open_position(self, asset: str, entry_price: float, size_pct: float) -> None:
+    def record_open_position(
+        self,
+        asset: str,
+        entry_price: float,
+        size_pct: float,
+        stop_loss_price: float = 0.0,
+        take_profit_price: Optional[float] = None,
+    ) -> None:
         asset = asset.upper()
         self._positions[asset] = OpenPosition(
             asset=asset,
             entry_price=entry_price,
             size_pct=size_pct,
             current_price=entry_price,
+            stop_loss_price=stop_loss_price,
+            take_profit_price=take_profit_price,
         )
         logger.info("Opened position: %s @ %.4f (%.1f%% of portfolio)", asset, entry_price, size_pct)
+
+    def update_position_levels(
+        self,
+        asset: str,
+        stop_loss_price: Optional[float],
+        take_profit_price: Optional[float],
+    ) -> None:
+        pos = self._positions.get(asset.upper())
+        if pos:
+            pos.stop_loss_price = stop_loss_price
+            pos.take_profit_price = take_profit_price
 
     def close_position(self, asset: str) -> None:
         if self._positions.pop(asset.upper(), None):
@@ -64,6 +86,7 @@ class RiskService:
         from app.models.execution import Execution
         from app.models.ai_decision import AIDecision
         from app.models.hourly_market_snapshot import HourlyMarketSnapshot
+        from app.models.trade import Trade
 
         assets = db.query(Asset).all()
         for asset in assets:
@@ -78,10 +101,20 @@ class RiskService:
                 .first()
             )
             if latest and latest.executed_action == "BUY":
-                size_pct = float(latest.ai_decision.recommended_size or 0)
                 entry_price = float(latest.execution_price or 0)
+                size_pct = float(
+                    (latest.ai_decision.recommended_size if latest.ai_decision else None) or 0
+                )
                 if entry_price > 0 and size_pct > 0:
-                    self.record_open_position(asset.symbol, entry_price, size_pct)
+                    open_trade = (
+                        db.query(Trade)
+                        .filter(Trade.symbol == asset.symbol, Trade.status == "open")
+                        .order_by(desc(Trade.opened_at))
+                        .first()
+                    )
+                    sl = float(open_trade.stop_loss_price) if open_trade and open_trade.stop_loss_price else None
+                    tp = float(open_trade.take_profit_price) if open_trade and open_trade.take_profit_price else None
+                    self.record_open_position(asset.symbol, entry_price, size_pct, sl, tp)
                     logger.info(
                         "Restored position: %s @ %.4f (%.1f%%)",
                         asset.symbol, entry_price, size_pct,

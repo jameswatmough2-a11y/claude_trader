@@ -14,6 +14,8 @@ from app.api.routes.market import router as market_router
 from app.api.routes.chart import router as chart_router
 from app.api.routes.bot_control import router as bot_control_router
 from app.api.routes.logs import router as logs_router
+from app.api.routes.sessions import router as sessions_router
+from app.api.routes.trades import router as trades_router
 from app.db.init_db import init_db
 from app.db.session import SessionLocal
 from app.state import (
@@ -21,6 +23,7 @@ from app.state import (
     trigger_executor,
     risk_service,
     execution_service,
+    session_service,
     scheduler,
 )
 
@@ -37,8 +40,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     import asyncio
     from app.config import settings
     from app.services import db_logger
+    from app.state import bot_state
 
     init_db()
+
+    # Inject DB factory into trigger_executor so it can close trades on SL/TP
+    trigger_executor.session_factory = SessionLocal
 
     db = SessionLocal()
     try:
@@ -50,6 +57,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         row = db.get(BotConfig, 1)
         if row:
             _apply_settings(row)
+
+        # Re-link to any active session from before a server restart
+        active = session_service.get_active_session(db)
+        if active:
+            bot_state.current_session_id = active.id
+            logger.info("Resumed session %d from previous run", active.id)
     finally:
         db.close()
 
@@ -64,7 +77,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         },
     )
 
-    # In live mode, reconcile positions against exchange on startup
     if not settings.paper_trading:
         _reconcile_live_positions()
 
@@ -86,7 +98,7 @@ async def _prewarm_sentiment() -> None:
     from app.config import settings
     from app.services.sentiment_service import get_all_sentiment
 
-    await asyncio.sleep(8)  # let WebSocket connect and stabilise first
+    await asyncio.sleep(8)
     try:
         logger.info("Pre-warming sentiment cache for %s", settings.tracked_symbols)
         await asyncio.to_thread(get_all_sentiment, settings.tracked_symbols)
@@ -101,7 +113,7 @@ def _reconcile_live_positions() -> None:
 
     logger.info("Live mode: reconciling positions against exchange")
     try:
-        from app.services.data_feeds import get_exchange, _to_ccxt_symbol
+        from app.services.data_feeds import get_exchange
         from app.config import settings
 
         exchange = get_exchange()
@@ -113,16 +125,14 @@ def _reconcile_live_positions() -> None:
         for symbol, pos in internal_positions.items():
             base = symbol[:-4] if symbol.endswith("USDT") else symbol
             exchange_qty = float(balance.get(base, {}).get("total", 0))
-            expected_qty = pos.size_pct / 100.0  # approximate — exact qty not tracked in-memory
 
             if exchange_qty <= 0:
                 note = f"{symbol}: internal says LONG but exchange balance is 0 — position may be closed"
                 logger.warning(note)
-                reconciliation_notes.append(note)
             else:
                 note = f"{symbol}: internal LONG confirmed (exchange {base} balance={exchange_qty:.6f})"
                 logger.info(note)
-                reconciliation_notes.append(note)
+            reconciliation_notes.append(note)
 
         db_logger.log_info(
             "system", "live_reconciliation",
@@ -147,3 +157,5 @@ app.include_router(market_router)
 app.include_router(chart_router)
 app.include_router(bot_control_router)
 app.include_router(logs_router)
+app.include_router(sessions_router)
+app.include_router(trades_router)

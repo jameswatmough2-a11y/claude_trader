@@ -247,5 +247,14 @@ def get_all_sentiment(symbols: list[str]) -> dict[str, AssetSentiment]:
     return results
 
 
+def get_sentiment_cache_status() -> dict:
+    now = time.time()
+    return {
+        s: {"cached": True, "age_seconds": round(now - ts)}
+        for s, (ts, data) in _sentiment_cache.items()
+        if data is not None
+    }
+
+
 def clear_sentiment_cache() -> None:
     _sentiment_cache.clear()

@@ -8,7 +8,9 @@ This document explains what data is stored in the database, what is kept only in
 
 The database is a single SQLite file at the path configured by `DATABASE_URL` (default: `crypto_bot/crypto_bot.db`).
 
-Tables are created on startup by `init_db()` → `Base.metadata.create_all(bind=engine)`. New columns on existing tables are added by the migration functions (`_migrate_bot_config`, `_migrate_ai_decision`, `_migrate_execution`) using `ALTER TABLE ADD COLUMN` — safe for zero-downtime upgrades.
+Tables are created on startup by `init_db()` → `Base.metadata.create_all(bind=engine)`. New columns on existing tables are added by the migration functions (`_migrate_bot_config`, `_migrate_ai_decision`, `_migrate_execution`, `_migrate_hourly_market_snapshots`, `_migrate_executions_session_trade`) using `ALTER TABLE ADD COLUMN` — safe for zero-downtime upgrades.
+
+`_ensure_default_user()` runs on every startup and inserts `id=1` `name='default'` into `users` if it doesn't exist, guaranteeing multi-tenancy scaffolding is always ready.
 
 ### Session management
 
@@ -21,6 +23,76 @@ Tables are created on startup by `init_db()` → `Base.metadata.create_all(bind=
 ---
 
 ## ORM Models
+
+### `User`
+
+```
+users
+├── id          INTEGER   PRIMARY KEY (always 1 for the default user)
+├── name        VARCHAR   NOT NULL    (default "default")
+└── created_at  DATETIME  NOT NULL
+```
+
+Multi-tenancy scaffold. A single default user (`id=1`) is auto-created by `_ensure_default_user()` on startup. All `TradingSession` and `Trade` rows carry `user_id=1`.
+
+---
+
+### `TradingSession`
+
+```
+trading_sessions
+├── id                    INTEGER   PRIMARY KEY
+├── user_id               INTEGER   FK → users.id
+├── started_at            DATETIME  NOT NULL    (UTC)
+├── ended_at              DATETIME  NULLABLE
+├── status                VARCHAR   NOT NULL    ("active", "stopped", "crashed")
+├── starting_balance_usdt NUMERIC(20,8)  NOT NULL
+├── ending_balance_usdt   NUMERIC(20,8)  NULLABLE
+└── notes                 TEXT      NULLABLE    (JSON snapshot of BotConfig at session start)
+```
+
+One row per bot run. Created by `POST /start`, closed by `POST /stop`.
+
+**Computed properties** (Python, not DB columns):
+- `duration_seconds` — `(ended_at - started_at).total_seconds()` or live elapsed time
+- `pnl_usdt` — `ending_balance_usdt - starting_balance_usdt`
+- `pnl_pct` — `pnl_usdt / starting_balance_usdt × 100`
+
+On server restart, `session_service.get_active_session()` re-links `bot_state.current_session_id` to any session left in `active` status.
+
+---
+
+### `Trade`
+
+```
+trades
+├── id                  INTEGER   PRIMARY KEY
+├── session_id          INTEGER   FK → trading_sessions.id
+├── user_id             INTEGER   FK → users.id
+├── symbol              VARCHAR   NOT NULL     (e.g. "BTCUSDT")
+├── entry_execution_id  INTEGER   FK → executions.id
+├── entry_price         NUMERIC(20,8)
+├── entry_qty           NUMERIC(20,8)
+├── entry_fee_usdt      NUMERIC(20,8)
+├── size_pct            NUMERIC(20,8)    (% of portfolio)
+├── opened_at           DATETIME  NOT NULL
+├── stop_loss_price     NUMERIC(20,8)   NULLABLE
+├── take_profit_price   NUMERIC(20,8)   NULLABLE
+├── exit_execution_id   INTEGER   FK → executions.id    NULLABLE
+├── exit_price          NUMERIC(20,8)   NULLABLE
+├── exit_fee_usdt       NUMERIC(20,8)   NULLABLE
+├── exit_reason         VARCHAR   NULLABLE    ("ai_sell", "stop_loss", "take_profit", "session_end")
+├── closed_at           DATETIME  NULLABLE
+├── realized_pnl_pct    NUMERIC(20,8)   NULLABLE
+├── realized_pnl_usdt   NUMERIC(20,8)   NULLABLE
+└── status              VARCHAR   NOT NULL    ("open", "closed")
+```
+
+One row per BUY→SELL lifecycle. At most one `open` trade per `(session_id, symbol)` pair.
+
+`realized_pnl_usdt` = `qty × (exit_price − entry_price) − total_fees`. Computed by `TradeService.close_trade()`.
+
+---
 
 ### `BotConfig`
 
@@ -38,6 +110,7 @@ bot_config
 ├── chart_interval          VARCHAR   (display only)
 ├── model_name              VARCHAR
 ├── ohlcv_interval          VARCHAR   (default "1h")
+├── ohlcv_limit             INTEGER   (default 50 — candles fetched per cycle)
 ├── taker_fee_rate          NUMERIC(10,6)  (default 0.001)
 ├── timezone                VARCHAR   (display only)
 ├── display_currency        VARCHAR   (display only)
@@ -79,7 +152,8 @@ hourly_market_snapshots
 ├── close_price                NUMERIC(20,8)   (= last_price from WebSocket)
 ├── volume                     NUMERIC(30,8)
 ├── price_change_1h_pct        NUMERIC(10,4)   NULLABLE
-└── price_change_since_entry_pct NUMERIC(10,4) NULLABLE
+├── price_change_since_entry_pct NUMERIC(10,4) NULLABLE
+└── session_id                 INTEGER         NULLABLE   FK → trading_sessions.id (migration-added)
 ```
 
 Unique constraint: `(asset_id, snapshot_time)`.
@@ -169,7 +243,9 @@ executions
 ├── verification_status VARCHAR         NULLABLE  ("filled", "partial_or_open", "verification_failed")
 ├── slippage            NUMERIC(20,8)   NULLABLE
 ├── execution_time      DATETIME        NULLABLE
-└── status              VARCHAR    ("paper_filled", "filled", "rejected", "none")
+├── status              VARCHAR    ("paper_filled", "filled", "rejected", "none")
+├── session_id          INTEGER    NULLABLE    FK → trading_sessions.id (migration-added)
+└── trade_id            INTEGER    NULLABLE    FK → trades.id (migration-added)
 ```
 
 `fees_paid` = `qty × execution_price × fee_rate`. Accurate for paper trades.
@@ -229,7 +305,9 @@ In-memory market info cache. Lost on restart — refetched from ccxt on first us
 | Bot configuration | **Yes** | `bot_config` row; `_apply_settings()` reapplies on startup |
 | Open positions | **Yes** | Restored via `RiskService.restore_from_db()` |
 | Entry prices | **Yes** | Stored in `positions` table |
-| Paper USDT balance | **Yes** | `ExecutionService.restore_paper_balance_from_db()` replays executions |
+| Paper USDT balance | **Yes** | `ExecutionService.restore_paper_balance_from_db()` replays executions (subtracts fees correctly) |
+| Active session | **Yes** | `session_service.get_active_session()` re-links `bot_state.current_session_id` |
+| Trade rows | **Yes** | `trades` table is persistent |
 | OHLCV candles | **Yes** | `ohlcv_candles` table is persistent |
 | System log events | **Yes** | `system_logs` table is persistent |
 | Asset records | **Yes** | DB is persistent |
@@ -237,7 +315,7 @@ In-memory market info cache. Lost on restart — refetched from ccxt on first us
 | Execution records | **Yes** | DB is persistent |
 | Trade log (`trades.jsonl`) | **Yes** | File is appended, not overwritten |
 | Live market prices | **No** | `MarketStateStore` repopulates from WebSocket |
-| Sentiment cache | **No** | Refetched on next cycle |
+| Sentiment cache | **No** | Pre-warmed async task fires 8 s after startup |
 | Market info cache | **No** | Refetched from ccxt on next execution |
 | Pending exit queue | **No** | `asyncio.Queue` is in-memory |
 
@@ -252,16 +330,20 @@ Every execution attempt appends a JSON record to `logs/trades.jsonl`. This file 
 ## Database Schema
 
 ```
-assets (1) ──────────────────────────────── (N) hourly_market_snapshots
-                                                       │ (1)
-                                                       ├── (1) positions
-                                                       └── (1) ai_decisions
-                                                                  │ (1)
-                                                                  └── (1) executions
+users (1) ───────── (N) trading_sessions (1) ─── (N) trades
+                              │
+                              │ session_id (nullable)
+                              │
+assets (1) ──── (N) hourly_market_snapshots ─────── session_id ─┘
+                          │ (1)
+                          ├── (1) positions
+                          └── (1) ai_decisions
+                                     │ (1)
+                                     └── (1) executions ─── trade_id ──► trades
 
 ohlcv_candles    (independent — linked by symbol string, not FK)
 
 system_logs      (independent — component-scoped event log)
 ```
 
-Cascade delete on all `assets` child relationships: deleting an `Asset` deletes its snapshots, positions, AI decisions, and executions. `ohlcv_candles` and `system_logs` are independent tables — they are cleared by `POST /reset-db` but not via cascade.
+Cascade delete on all `assets` child relationships: deleting an `Asset` deletes its snapshots, positions, AI decisions, and executions. `ohlcv_candles`, `system_logs`, `users`, `trading_sessions`, and `trades` are not part of the cascade — they are cleared explicitly by `POST /reset-db` in FK-safe order.

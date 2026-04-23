@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { Bot, LayoutDashboard, Menu, Moon, ScrollText, Settings, Sun, X } from 'lucide-react'
+import { Bot, History, LayoutDashboard, Menu, Moon, ScrollText, Settings, Sun, X } from 'lucide-react'
 import { useTheme } from 'next-themes'
 
 import { Button } from '@/components/ui/button'
@@ -27,6 +27,7 @@ export function MobileNav() {
     { href: '/', icon: <LayoutDashboard className="size-4" />, label: 'Overview' },
     { href: '/settings', icon: <Settings className="size-4" />, label: 'Settings' },
     { href: '/logs', icon: <ScrollText className="size-4" />, label: 'Logs' },
+    { href: '/sessions', icon: <History className="size-4" />, label: 'Sessions' },
   ]
 
   return (

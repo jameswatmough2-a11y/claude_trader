@@ -21,11 +21,14 @@ These are orchestrated from `app/main.py` via a FastAPI lifespan context manager
 ┌─────────────────────────────────────────────────────────────┐
 │                    FastAPI HTTP layer                        │
 │   /health  /assets  /positions  /decisions  /logs           │
+│   /sessions  /sessions/{id}  /sessions/{id}/markers         │
+│   /trades                                                    │
 └────────────────────────┬────────────────────────────────────┘
                          │ reads DB via SQLAlchemy
 ┌────────────────────────▼────────────────────────────────────┐
 │                    Persistence layer                         │
-│             SQLite + SQLAlchemy ORM (7 tables)               │
+│             SQLite + SQLAlchemy ORM (10 tables)              │
+│   users  /  trading_sessions  /  trades                      │
 │   assets  /  hourly_market_snapshots  /  positions           │
 │   ai_decisions  /  executions                                │
 │   ohlcv_candles  /  system_logs                              │
@@ -38,6 +41,7 @@ These are orchestrated from `app/main.py` via a FastAPI lifespan context manager
 └─────────┬────────────────┘       └──────────┬─────────────┘
           │ reads                              │ executes SELL
           │                                   │ consumes trigger_queue
+          │                                   │ closes Trade on SL/TP
 ┌─────────▼───────────────────────────────────────────────────┐
 │                  Market State Store                          │
 │          in-memory dict[str, SymbolMarketState]              │
@@ -64,14 +68,15 @@ All service instances are created at **module level** (singletons for the proces
 
 ```python
 # Startup sequence (inside lifespan):
-init_db()                                    # 1. Create/migrate SQLite tables
-asyncio.create_task(ws_service.run_forever()) # 2. Start WebSocket stream
-asyncio.create_task(trigger_executor.run_forever()) # 3. Start exit processor
-restore_state()                              # 4. Restore positions + paper balance from DB
-_reconcile_live_positions()                  # 5. Live mode: compare internal state vs exchange
-db_logger.log_info(...)                      # 6. Log server_start event
-scheduler.add_job(run_hourly_cycle, ...)     # 7. Schedule trading cycle
-scheduler.start()                            # 8. Fire first cycle immediately
+init_db()                                    # 1. Create/migrate SQLite tables + ensure default user
+trigger_executor.session_factory = SessionLocal  # 2. Inject DB factory for trade close on SL/TP
+restore_state()                              # 3. Restore positions + paper balance from DB
+_apply_settings(row)                         # 4. Apply persistent bot config
+active = session_service.get_active_session()  # 5. Re-link to session from before server restart
+asyncio.create_task(ws_service.run_forever()) # 6. Start WebSocket stream
+asyncio.create_task(trigger_executor.run_forever()) # 7. Start exit processor
+asyncio.create_task(_prewarm_sentiment())    # 8. Warm sentiment cache in background
+scheduler.start()                            # 9. Start scheduler (waits for /start)
 ```
 
 Service wiring is explicit constructor injection — each service receives its dependencies at creation time:
@@ -82,7 +87,9 @@ risk_service      = RiskService()
 execution_service = ExecutionService(risk_service=risk_service)
 trading_cycle     = TradingCycleService(market_store, risk_service, execution_service)
 ws_service        = BinanceWebSocketService(symbols, market_store, risk_service, trigger_queue)
-trigger_executor  = TriggerExecutor(trigger_queue, execution_service)
+trigger_executor  = TriggerExecutor(trigger_queue, execution_service, session_factory=None)
+session_service   = SessionService()
+trade_service     = TradeService()
 ```
 
 ---
@@ -118,22 +125,27 @@ On connect/disconnect, `db_logger.log_info` / `log_warning` events are written t
 
 Drains `trigger_queue` in an async loop. Each dequeued order is dispatched to the default thread pool executor via `loop.run_in_executor()`, keeping the WebSocket message loop unblocked.
 
+On a successful execution, `_close_trade()` opens a short-lived `SessionLocal` session to look up the open `Trade` row for the symbol and close it with the appropriate `exit_reason` (`stop_loss` or `take_profit`). The `session_factory` is injected in `main.py`'s lifespan after `SessionLocal` is available.
+
 ---
 
 ### `TradingCycleService` — Scheduled orchestrator
 
 The synchronous `run(db)` method is called by APScheduler from a thread pool worker. Steps:
 
-1. Build `market_data` from `MarketStateStore`
-2. Call `_enrich_and_store_ohlcv()` — fetches real OHLCV candles via ccxt using `settings.ohlcv_interval`, upserts to `ohlcv_candles` table, attaches candle list to market data dict
-3. Call `_fetch_sentiment(symbols)` — reads from TTL cache or fetches concurrently
-4. Call `_fetch_decisions(market_data, sentiment_data, symbols)`:
+1. Read `bot_state.current_session_id` — passed to `_persist_cycle` to stamp snapshots and executions
+2. Build `market_data` from `MarketStateStore`
+3. Call `_enrich_and_store_ohlcv()` — fetches real OHLCV candles via ccxt using `settings.ohlcv_interval`, upserts to `ohlcv_candles` table, attaches candle list to market data dict
+4. Call `_fetch_sentiment(symbols)` — reads from TTL cache or fetches concurrently
+5. Call `_fetch_decisions(market_data, sentiment_data, symbols)`:
    - Attempts `ai_service.get_trading_decisions()` (Claude API)
    - On failure, falls back to `fallback_strategy.get_fallback_decisions()` — SMA-based rule engine
    - Logs AI failure and fallback activation to `system_logs`
-5. Call `risk_service.filter_decisions(decisions, market_data)`
-6. For each decision, execute and persist — `decision_source` ("ai" or "fallback_rule") is stored in `ai_decisions` table
-7. Log `cycle_start` / `cycle_end` events to `system_logs` with `cycle_id` timestamp
+6. Call `risk_service.filter_decisions(decisions, market_data)`
+7. For each decision, execute and persist — `_persist_cycle` handles Trade lifecycle:
+   - BUY filled → `trade_service.open_trade()` creates a `Trade` row; `execution.trade_id` set
+   - SELL filled → `trade_service.get_open_trade_for_symbol()` + `close_trade()` with inferred `exit_reason`
+8. Log `cycle_start` / `cycle_end` events to `system_logs` with `cycle_id` timestamp
 
 ---
 
@@ -255,7 +267,9 @@ main.py
   │                                AIService, FallbackStrategy, SentimentService,
   │                                DataFeeds, DbLogger
   ├── BinanceWebSocketService   ← MarketStateStore, RiskService, trigger_queue, DbLogger
-  └── TriggerExecutor           ← trigger_queue, ExecutionService
+  ├── TriggerExecutor           ← trigger_queue, ExecutionService, SessionLocal (injected)
+  ├── SessionService            (no deps — thin DB wrapper)
+  └── TradeService              (no deps — thin DB wrapper)
 
 TradingCycleService.run()
   ├── data_feeds.fetch_ohlcv()              (← ccxt, settings.ohlcv_interval)
@@ -276,17 +290,19 @@ The dashboard is a **Next.js App Router** application in `dashboard/`. It commun
 
 ### Pages
 
-- **Overview** (`/`) — bot controls, stat cards, candlestick chart, decisions table
+- **Overview** (`/`) — bot controls, stat cards (including live session P&L), candlestick chart with trade markers, decisions table
 - **Settings** (`/settings`) — config editor; fields locked while bot is running
-- **Logs** (`/logs`) — structured event log viewer; filterable, paginated
+- **Logs** (`/logs`) — structured event log viewer; filterable, paginated, 15s auto-refresh
+- **Sessions** (`/sessions`) — paginated list of all bot sessions with P&L, win rate, trade count
+- **Session Detail** (`/sessions/[id]`) — per-session stats and full trades table
 
 ### Key components
 
-**`app-sidebar.tsx`** — nav links (Overview, Settings, Logs), bot status badge, live clock, theme toggle.
+**`app-sidebar.tsx`** — nav links (Overview, Settings, Logs, Sessions), bot status badge, live clock, theme toggle.
 
-**`mobile-nav.tsx`** — mobile slide-in drawer with the same nav links.
+**`mobile-nav.tsx`** — mobile slide-in drawer with the same four nav links.
 
-**`candlestick-chart.tsx`** — TradingView Lightweight Charts. Live price, entry, SL, and TP price lines with toggles.
+**`candlestick-chart.tsx`** — TradingView Lightweight Charts. Live price, entry, SL, and TP price lines with toggles. Trade markers (BUY arrow up / SELL arrow down) and background shading for each trade range (green = win, red = loss) fetched from `GET /api/sessions/current/markers`.
 
 **`providers/display-prefs-provider.tsx`** — global timezone/currency context; `fmtTime(iso)` corrects SQLite naive timestamps for display.
 

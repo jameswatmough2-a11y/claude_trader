@@ -72,7 +72,16 @@ async def run_forever(self):
 1. Fetches balance (paper stub or ccxt)
 2. Builds `market_data = {asset: {"last_price": trigger_price}}`
 3. Calls `execution_service.execute_decision(order, market_data, balance)`
-4. Logs result at `WARNING` level
+4. On success, calls `_close_trade(order, result)` if `session_factory` is set
+5. Logs result at `WARNING` level
+
+`_close_trade(order, result)` opens a short-lived `SessionLocal` session:
+1. Reads `bot_state.current_session_id`
+2. Calls `trade_service.get_open_trade_for_symbol(db, session_id, symbol)`
+3. Infers `exit_reason` from `order["reasoning"]` (contains "stop" → `stop_loss`, "take/profit" → `take_profit`)
+4. Calls `trade_service.close_trade(...)`, commits, closes session
+
+`session_factory` is injected in `main.py`'s lifespan as `SessionLocal` after the DB is initialized.
 
 The position is already removed from `RiskService._positions` before the order reaches the queue — re-triggering on the next tick is impossible.
 
@@ -307,15 +316,81 @@ Hourly (or configurable-interval) orchestrator. Coordinates OHLCV fetch, sentime
 ### `_persist_cycle` — database write sequence
 
 ```
-1. HourlyMarketSnapshot  →  flush  →  snapshot.id
+1. HourlyMarketSnapshot (session_id stamped)  →  flush  →  snapshot.id
 2. Position              →  flush  →  position.id
 3. execute_decision() called here (side effect: updates RiskService._positions)
 4. AIDecision (with decision_source)  →  flush  →  ai_rec.id
-5. Execution (with fee_amount, fee_rate, fill_source, verification_status)  →  commit
+5. Execution (session_id stamped)  →  flush  →  execution.id
+6. Trade lifecycle:
+   - BUY filled → trade_service.open_trade() → Trade row created
+     execution.trade_id = trade.id
+   - SELL filled → trade_service.get_open_trade_for_symbol() + close_trade()
+     exit_reason inferred from decision reasoning text
+7. db.commit()
 ```
 
 ### `_get_or_create_asset`
 Queries DB for existing `Asset` by symbol; inserts if not found. Called inside `try/except IntegrityError` to handle concurrent cycle runs.
+
+---
+
+## `session_service.py`
+
+### Purpose
+Manages `TradingSession` lifecycle — create on bot start, close on bot stop, re-link on server restart.
+
+### API
+
+```python
+create_session(db, starting_balance_usdt) → TradingSession
+```
+Creates a new `TradingSession` with `status="active"`, stamps `starting_balance_usdt`, and serializes the current `BotConfig` row into `notes` as a JSON snapshot. Commits and returns the refreshed row.
+
+```python
+close_session(db, session_id, ending_balance_usdt, status="stopped") → TradingSession | None
+```
+Sets `ended_at`, `status`, and `ending_balance_usdt`. Commits.
+
+```python
+get_active_session(db) → TradingSession | None
+```
+Returns the most recent session with `status="active"`. Used on server restart to re-link `bot_state.current_session_id`.
+
+---
+
+## `trade_service.py`
+
+### Purpose
+Manages `Trade` lifecycle — open on BUY execution, close on SELL/SL/TP.
+
+### API
+
+```python
+open_trade(db, session_id, symbol, entry_execution_id, entry_price, entry_qty,
+           entry_fee_usdt, size_pct, opened_at, stop_loss_price, take_profit_price)
+    → Trade
+```
+Creates a `Trade` with `status="open"`, `user_id=1`. Flushes (does not commit — caller handles commit).
+
+```python
+close_trade(db, trade_id, exit_execution_id, exit_price, exit_fee_usdt,
+            exit_reason, closed_at) → Trade | None
+```
+Fills exit fields. Computes:
+- `realized_pnl_pct` = `(exit_price − entry_price) / entry_price × 100`
+- `realized_pnl_usdt` = `qty × (exit_price − entry_price) − total_fees`
+
+Flushes (caller commits). No-op if already closed.
+
+```python
+get_open_trade_for_symbol(db, session_id, symbol) → Trade | None
+```
+Finds the most recent `open` trade for the given symbol/session. Filters by `session_id` if provided.
+
+```python
+get_session_stats(db, session_id) → dict
+```
+Returns `{ total_trades, open_trades, winning_trades, losing_trades, win_rate, total_pnl_usdt, total_fees_usdt }` aggregated from the session's trades.
 
 ---
 

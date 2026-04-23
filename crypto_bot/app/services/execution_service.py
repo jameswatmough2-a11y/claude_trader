@@ -45,11 +45,12 @@ class ExecutionService:
         for ex in executions:
             size = float(ex.executed_size or 0)
             price = float(ex.execution_price or 0)
+            fees = float(ex.fees_paid or 0)
             cost = size * price
             if ex.executed_action == "BUY":
-                balance -= cost
+                balance -= cost + fees
             elif ex.executed_action == "SELL":
-                balance += cost
+                balance += cost - fees
 
         self._paper_usdt = max(0.0, balance)
         logger.info("Paper balance restored from DB: %.2f USDT", self._paper_usdt)
@@ -109,14 +110,6 @@ class ExecutionService:
             )
 
         return record
-
-    def execute_all_decisions(
-        self,
-        decisions: list[dict[str, Any]],
-        market_data: dict[str, Any],
-        balance: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        return [self.execute_decision(d, market_data, balance) for d in decisions]
 
     # ── Paper execution ────────────────────────────────────────────────────────
 

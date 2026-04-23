@@ -36,6 +36,7 @@ class HourlyMarketSnapshot(Base):
 
     price_change_1h_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 4), nullable=True)
     price_change_since_entry_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 4), nullable=True)
+    session_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     asset: Mapped["Asset"] = relationship(back_populates="snapshots")
     position: Mapped[Optional["Position"]] = relationship(

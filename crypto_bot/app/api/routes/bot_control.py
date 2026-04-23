@@ -17,7 +17,7 @@ from app.models.ai_decision import AIDecision
 from app.models.position import Position
 from app.models.hourly_market_snapshot import HourlyMarketSnapshot
 from app.models.asset import Asset
-from app.state import bot_state, scheduler, run_hourly_cycle, risk_service, execution_service, ws_service
+from app.state import bot_state, scheduler, run_hourly_cycle, risk_service, execution_service, ws_service, session_service, market_store
 
 logger = logging.getLogger(__name__)
 
@@ -119,22 +119,71 @@ async def start(db: Session = Depends(get_db)) -> dict:
         next_run_time=datetime.now(timezone.utc) + timedelta(seconds=5),
     )
     bot_state.running = True
-    logger.info("Bot started — interval=%d min", interval)
+
+    # Create a new trading session
+    sess = session_service.create_session(db, starting_balance_usdt=execution_service.paper_usdt)
+    bot_state.current_session_id = sess.id
+
+    logger.info("Bot started — interval=%d min session=%d", interval, sess.id)
     from app.services import db_logger
-    db_logger.log_info("system", "bot_start", f"Bot started — interval={interval} min")
-    return {"running": True, "message": "Bot started"}
+    db_logger.log_info("system", "bot_start", f"Bot started — interval={interval} min session={sess.id}")
+    return {"running": True, "message": "Bot started", "session_id": sess.id}
 
 
 @router.post("/stop")
-def stop() -> dict:
+async def stop(db: Session = Depends(get_db)) -> dict:
     if not bot_state.running:
         return {"running": False, "message": "Not running"}
 
+    # Halt the scheduler first so no new cycle can start
     try:
         scheduler.remove_job("hourly_trading_cycle")
     except Exception:
         pass
     bot_state.running = False
+
+    # Wait for any in-flight cycle to finish before touching the DB.
+    # The cycle holds a write transaction between flush and commit; writing
+    # concurrently causes "database is locked" even with WAL mode.
+    for _ in range(120):
+        if not bot_state.cycle_active:
+            break
+        await asyncio.sleep(0.5)
+
+    if bot_state.current_session_id:
+        from app.state import trade_service
+        from app.models.trade import Trade
+
+        open_trades = db.query(Trade).filter(
+            Trade.session_id == bot_state.current_session_id,
+            Trade.status == "open",
+        ).all()
+
+        now = datetime.now(timezone.utc)
+        for trade in open_trades:
+            state = market_store.get(trade.symbol)
+            exit_price = float(state.last_price) if state and state.last_price else float(trade.entry_price or 0)
+            entry_qty = float(trade.entry_qty or 0)
+
+            trade_service.close_trade(
+                db, trade.id,
+                exit_execution_id=None,
+                exit_price=exit_price,
+                exit_fee_usdt=0.0,
+                exit_reason="session_end",
+                closed_at=now,
+            )
+
+            # Return proceeds to paper balance and remove in-memory position
+            if entry_qty > 0:
+                execution_service._paper_usdt += entry_qty * exit_price
+            risk_service.close_position(trade.symbol)
+
+        # Commit all trade closures, then close the session with the final balance
+        db.commit()
+        session_service.close_session(db, bot_state.current_session_id, execution_service.paper_usdt)
+        bot_state.current_session_id = None
+
     logger.info("Bot stopped by user")
     from app.services import db_logger
     db_logger.log_info("system", "bot_stop", "Bot stopped by user")
@@ -159,10 +208,14 @@ def reset(db: Session = Depends(get_db)) -> dict:
     # Clear all trading data in FK-safe cascade order
     from app.models.system_log import SystemLog
     from app.models.ohlcv_candle import OhlcvCandle
+    from app.models.trade import Trade
+    from app.models.trading_session import TradingSession
     db.query(Execution).delete()
     db.query(AIDecision).delete()
     db.query(Position).delete()
     db.query(HourlyMarketSnapshot).delete()
+    db.query(Trade).delete()
+    db.query(TradingSession).delete()
     db.query(Asset).delete()
     db.query(OhlcvCandle).delete()
     db.query(SystemLog).delete()
@@ -171,6 +224,7 @@ def reset(db: Session = Depends(get_db)) -> dict:
     # Reset in-memory state
     risk_service._positions.clear()
     execution_service._paper_usdt = settings.paper_balance_usdt
+    bot_state.current_session_id = None
 
     logger.info("Database reset — all trading records cleared")
     return {"reset": True, "running": False, "message": "Database cleared"}

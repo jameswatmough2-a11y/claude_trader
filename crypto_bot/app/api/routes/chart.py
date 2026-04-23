@@ -8,7 +8,6 @@ from typing import Any
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
-from app.config import settings
 from app.services.data_feeds import fetch_ohlcv
 from app.state import market_store, risk_service
 
@@ -101,12 +100,32 @@ async def chart_ws(ws: WebSocket) -> None:
     symbol: str | None = None
     builder: _CandleBuilder | None = None
     last_price: float | None = None
+    # Track sent position so we only push when it actually changes
+    last_pos_key: tuple | None = None
 
     async def _send(payload: dict[str, Any]) -> None:
         try:
             await ws.send_json(payload)
         except Exception:
             pass
+
+    async def _sync_position(sym: str) -> None:
+        nonlocal last_pos_key
+        pos = risk_service.get_open_positions().get(sym)
+        pos_key = (pos.entry_price, pos.stop_loss_price, pos.take_profit_price) if pos else None
+        if pos_key == last_pos_key:
+            return
+        last_pos_key = pos_key
+        if pos is not None:
+            await _send({
+                "type": "position",
+                "entry_price": pos.entry_price,
+                "stop_loss_price": pos.stop_loss_price,
+                "take_profit_price": pos.take_profit_price,
+                "size_pct": pos.size_pct,
+            })
+        else:
+            await _send({"type": "position_cleared"})
 
     try:
         while True:
@@ -117,23 +136,9 @@ async def chart_ws(ws: WebSocket) -> None:
                     symbol = str(msg.get("symbol", "BTCUSDT")).upper()
                     interval = str(msg.get("interval", "1m"))
                     builder = _CandleBuilder(_interval_seconds(interval))
-                    last_price = None  # force first tick to fire
-
-                    positions = risk_service.get_open_positions()
-                    pos = positions.get(symbol)
-                    if pos is not None:
-                        sl = pos.entry_price * (1 - settings.stop_loss_pct / 100)
-                        tp = (
-                            pos.entry_price * (1 + settings.take_profit_pct / 100)
-                            if settings.take_profit_pct > 0 else None
-                        )
-                        await _send({
-                            "type": "position",
-                            "entry_price": pos.entry_price,
-                            "stop_loss_price": round(sl, 8),
-                            "take_profit_price": round(tp, 8) if tp is not None else None,
-                            "size_pct": pos.size_pct,
-                        })
+                    last_price = None
+                    last_pos_key = None  # force resend of position state on resubscribe
+                    await _sync_position(symbol)
             except asyncio.TimeoutError:
                 pass
             except Exception:
@@ -142,6 +147,9 @@ async def chart_ws(ws: WebSocket) -> None:
             if symbol is None or builder is None:
                 await asyncio.sleep(0.1)
                 continue
+
+            # Sync position state on every iteration (detects opens/closes live)
+            await _sync_position(symbol)
 
             state = market_store.get(symbol)
             if state and state.last_price is not None:

@@ -12,13 +12,15 @@ All endpoints are unauthenticated — the API is intended for local use only.
 
 Starts the trading cycle scheduler. Fires one cycle immediately, then runs on `interval_minutes` cadence. No-op if already running.
 
+Also creates a new `TradingSession` row and stores the session ID in `bot_state.current_session_id`. Returns `{ running, message, session_id }`.
+
 ### `POST /stop`
 
-Pauses the scheduler. Open positions are not closed; stop-loss/take-profit resume on the next start.
+Pauses the scheduler. Any open trades are closed at the current market price with `exit_reason="session_end"`. The active session is closed (`status="stopped"`, `ending_balance_usdt` set).
 
 ### `POST /reset-db`
 
-Drops and recreates all database tables. Resets in-memory positions and paper balance. **Disabled while the bot is running.**
+Clears all trading data (executions, decisions, positions, snapshots, trades, sessions, assets, OHLCV candles, system logs) in FK-safe order. Resets in-memory positions and paper balance. **Disabled while a cycle is active.**
 
 ---
 
@@ -47,6 +49,7 @@ Updates the persistent configuration. Mutates the live `settings` singleton imme
 | `chart_interval` | string | Default chart timeframe (display only) |
 | `model_name` | string | Claude model, e.g. `"claude-sonnet-4-6"` |
 | `ohlcv_interval` | string | OHLCV fetch interval: `1m` `5m` `15m` `1h` `4h` `1d` |
+| `ohlcv_limit` | integer | Number of candles to fetch per cycle (10–500, default 50) |
 | `taker_fee_rate` | float | Paper trade fee rate (default `0.001` = 0.1%) |
 | `timezone` | string | IANA timezone for display (display only) |
 | `display_currency` | string | Display currency (display only) |
@@ -223,6 +226,76 @@ Returns a list of distinct `component` values present in `system_logs`. Used to 
 Returns a list of distinct `event_type` values present in `system_logs`.
 
 **Example response:** `["cycle_start", "cycle_end", "ai_request", "ai_request_failed", "fallback_activated", "order_placed", "ws_connected", "server_start"]`
+
+---
+
+## Sessions
+
+### `GET /sessions`
+
+Paginated list of all bot sessions, most recent first.
+
+**Query params:** `limit` (default 50, max 500), `offset` (default 0).
+
+Each item includes: `id`, `started_at`, `ended_at`, `status`, `duration_seconds`, `starting_balance_usdt`, `ending_balance_usdt`, `pnl_usdt`, `pnl_pct`, `total_trades`, `winning_trades`, `losing_trades`, `win_rate`, `total_pnl_usdt`, `total_fees_usdt`.
+
+### `GET /sessions/current`
+
+Active session detail with live P&L from the in-memory paper balance.
+
+Returns `null` if no session is active. Extra fields vs. list: `live_balance_usdt`, `live_pnl_usdt`, `live_pnl_pct`.
+
+### `GET /sessions/{session_id}`
+
+Full session detail including a `trades` array (all trades sorted by `opened_at`).
+
+Each trade: `id`, `session_id`, `symbol`, `entry_price`, `exit_price`, `entry_qty`, `size_pct`, `stop_loss_price`, `take_profit_price`, `realized_pnl_pct`, `realized_pnl_usdt`, `entry_fee_usdt`, `exit_fee_usdt`, `exit_reason`, `opened_at`, `closed_at`, `status`.
+
+### `GET /sessions/{session_id}/markers`
+
+Chart markers and trade range highlighting for a given session and symbol.
+
+**Query params:** `symbol` (required, e.g. `BTCUSDT`), `timeframe` (default `1m`), `include_holds` (default `false`).
+
+**Response:**
+```json
+{
+  "markers": [
+    {
+      "time": 1714000000,
+      "position": "belowBar",
+      "color": "#089981",
+      "shape": "arrowUp",
+      "text": "BUY 20%",
+      "action": "BUY",
+      "price": 63450.12,
+      "confidence": 0.84,
+      "trade_id": 42
+    }
+  ],
+  "trade_ranges": [
+    {
+      "trade_id": 42,
+      "entry_time": 1714000000,
+      "exit_time": 1714003600,
+      "pnl_pct": 1.23,
+      "status": "closed"
+    }
+  ]
+}
+```
+
+`time` values are aligned to the nearest candle boundary for the given `timeframe`.
+
+---
+
+## Trades
+
+### `GET /trades`
+
+Flat list of trades, filterable.
+
+**Query params:** `session_id`, `symbol`, `status` (`open`/`closed`), `limit` (default 100), `offset` (default 0).
 
 ---
 

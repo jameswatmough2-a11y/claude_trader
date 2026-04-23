@@ -22,11 +22,13 @@ def list_decisions(
         {
             "id": row.id,
             "snapshot_id": row.snapshot_id,
-            "symbol": row.snapshot.asset.symbol,
-            "snapshot_time": row.snapshot.snapshot_time.isoformat(),
+            "symbol": row.snapshot.asset.symbol if row.snapshot and row.snapshot.asset else None,
+            "snapshot_time": row.snapshot.snapshot_time.isoformat() if row.snapshot else None,
             "action": row.action,
             "confidence_score": float(row.confidence_score) if row.confidence_score is not None else None,
             "reasoning_summary": row.reasoning_summary,
+            "execution_price": float(row.execution.execution_price) if row.execution and row.execution.execution_price else None,
+            "trade_id": row.execution.trade_id if row.execution else None,
         }
         for row in rows
     ]

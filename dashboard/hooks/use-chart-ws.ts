@@ -15,7 +15,7 @@ export interface WsCandle {
 
 export interface WsPosition {
   entry_price: number
-  stop_loss_price: number
+  stop_loss_price: number | null
   take_profit_price: number | null
   size_pct: number
 }
@@ -28,12 +28,14 @@ export interface WsPriceUpdate {
 type ServerMessage =
   | { type: 'candle'; data: WsCandle }
   | { type: 'price'; price: number; change_24h_pct: number | null }
-  | { type: 'position'; entry_price: number; stop_loss_price: number; take_profit_price: number | null; size_pct: number }
+  | { type: 'position'; entry_price: number; stop_loss_price: number | null; take_profit_price: number | null; size_pct: number }
+  | { type: 'position_cleared' }
 
 export interface ChartWsHandlers {
   onCandle: (candle: WsCandle) => void
   onPrice: (data: WsPriceUpdate) => void
   onPosition: (pos: WsPosition) => void
+  onPositionCleared?: () => void
   onConnected?: () => void
   onDisconnected?: () => void
 }
@@ -103,6 +105,9 @@ export function useChartWs(
               take_profit_price: msg.take_profit_price,
               size_pct: msg.size_pct,
             })
+            break
+          case 'position_cleared':
+            h.onPositionCleared?.()
             break
         }
       }
