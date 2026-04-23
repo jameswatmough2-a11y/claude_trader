@@ -15,6 +15,7 @@ from app.api.routes.assets import router as assets_router
 from app.api.routes.positions import router as positions_router
 from app.api.routes.decisions import router as decisions_router
 from app.api.routes.market import router as market_router
+from app.api.routes.chart import router as chart_router
 from app.config import settings
 from app.db.init_db import init_db
 from app.db.session import SessionLocal
@@ -89,3 +90,4 @@ app.include_router(assets_router)
 app.include_router(positions_router)
 app.include_router(decisions_router)
 app.include_router(market_router)
+app.include_router(chart_router)

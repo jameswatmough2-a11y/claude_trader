@@ -16,7 +16,8 @@ Claude Trader is a prototype cryptocurrency trading bot. It connects to Binance 
 | [trading_logic.md](trading_logic.md) | AI prompt design, risk rules, execution sizing |
 | [data_flow.md](data_flow.md) | How data moves from WebSocket tick to database record |
 | [configuration.md](configuration.md) | Every environment variable, defaults, and behavioral impact |
-| [api.md](api.md) | REST endpoints with example requests and responses |
+| [api.md](api.md) | REST endpoints + WebSocket protocol with example payloads |
+| [dashboard.md](dashboard.md) | Next.js dashboard — component map, WS hook, chart architecture |
 | [persistence.md](persistence.md) | ORM models, what lives in the DB vs. in memory, restart behavior |
 | [concurrency.md](concurrency.md) | Async architecture, two concurrent loops, race condition handling |
 | [limitations.md](limitations.md) | Prototype constraints, things that would break in production |
@@ -25,6 +26,8 @@ Claude Trader is a prototype cryptocurrency trading bot. It connects to Binance 
 ---
 
 ## Technology Stack
+
+### Backend (`crypto_bot/`)
 
 | Layer | Technology |
 |---|---|
@@ -37,9 +40,22 @@ Claude Trader is a prototype cryptocurrency trading bot. It connects to Binance 
 | Configuration | `python-dotenv` + Python dataclass |
 | Async runtime | Python `asyncio` (single event loop, no threads except trigger executor) |
 
+### Dashboard (`dashboard/`)
+
+| Layer | Technology |
+|---|---|
+| Framework | Next.js 16 (App Router) + TypeScript |
+| Styling | Tailwind CSS v4 |
+| UI components | shadcn/ui (nova preset) |
+| Candlestick chart | TradingView Lightweight Charts v5 |
+| Simple price chart | Recharts 3 (ComposedChart) |
+| Icons | lucide-react |
+
 ---
 
 ## Quick Start
+
+### Bot (backend)
 
 ```bash
 # 1. Clone and enter the repo
@@ -47,9 +63,9 @@ git clone <repo-url>
 cd claude_trader
 
 # 2. Create and activate a virtual environment
-python -m venv crypto_bot/env
-source crypto_bot/env/Scripts/activate    # Windows
-# source crypto_bot/env/bin/activate      # macOS / Linux
+python -m venv env
+source env/Scripts/activate    # Windows
+# source env/bin/activate      # macOS / Linux
 
 # 3. Install dependencies
 pip install -r crypto_bot/requirements.txt
@@ -63,7 +79,17 @@ cd crypto_bot
 uvicorn app.main:app --reload
 ```
 
-The server starts at `http://localhost:8000`. API docs at `/docs`.
+The bot starts at `http://localhost:8000`. Interactive API docs at `/docs`.
+
+### Dashboard (frontend)
+
+```bash
+cd dashboard
+npm install
+npm run dev
+```
+
+Open `http://localhost:3000`. The dashboard connects to the bot at `localhost:8000` automatically.
 
 The bot will:
 1. Initialize the SQLite database
@@ -96,36 +122,53 @@ With these three values set and Binance keys absent, the bot will:
 claude_trader/
 ├── crypto_bot/
 │   ├── app/
-│   │   ├── main.py                 # FastAPI app + service wiring + startup/shutdown
-│   │   ├── config.py               # Settings dataclass loaded from .env
+│   │   ├── main.py                  # FastAPI app + service wiring + startup/shutdown
+│   │   ├── config.py                # Settings dataclass loaded from .env
+│   │   ├── state.py                 # Service singletons (avoids circular imports)
 │   │   ├── db/
-│   │   │   ├── session.py          # SQLAlchemy engine + SessionLocal factory
-│   │   │   └── init_db.py          # Creates tables on startup
-│   │   ├── models/                 # SQLAlchemy ORM models
+│   │   │   ├── session.py           # SQLAlchemy engine + SessionLocal factory
+│   │   │   └── init_db.py           # Creates tables on startup
+│   │   ├── models/                  # SQLAlchemy ORM models
 │   │   │   ├── asset.py
 │   │   │   ├── hourly_market_snapshot.py
 │   │   │   ├── position.py
 │   │   │   ├── ai_decision.py
 │   │   │   └── execution.py
 │   │   ├── api/
-│   │   │   ├── deps.py             # get_db dependency
-│   │   │   └── routes/             # REST endpoints
-│   │   │       ├── health.py
-│   │   │       ├── assets.py
-│   │   │       ├── positions.py
-│   │   │       └── decisions.py
+│   │   │   ├── deps.py              # get_db dependency
+│   │   │   └── routes/              # REST + WebSocket endpoints
+│   │   │       ├── health.py        # GET /health
+│   │   │       ├── assets.py        # GET /assets
+│   │   │       ├── positions.py     # GET /positions
+│   │   │       ├── decisions.py     # GET /decisions
+│   │   │       ├── market.py        # GET /market  (live prices from WS cache)
+│   │   │       └── chart.py         # GET /chart/history + WS /ws/chart
 │   │   └── services/
-│   │       ├── market_state.py     # In-memory price cache
-│   │       ├── binance_ws.py       # Persistent WebSocket + real-time exit checks
-│   │       ├── trigger_executor.py # Async queue consumer for stop-loss / take-profit
-│   │       ├── data_feeds.py       # ccxt exchange factory + market data helpers
-│   │       ├── sentiment_service.py# RSS + Reddit + Fear & Greed sentiment scoring
-│   │       ├── ai_service.py       # Claude API call + prompt + response validation
-│   │       ├── risk_service.py     # Position tracking + risk rule enforcement
-│   │       ├── execution_service.py# Paper / live order placement
-│   │       └── trading_cycle.py   # Hourly orchestrator (data → AI → risk → execute → persist)
+│   │       ├── market_state.py      # In-memory price cache (MarketStateStore)
+│   │       ├── binance_ws.py        # Persistent WebSocket + real-time exit checks
+│   │       ├── trigger_executor.py  # Async queue consumer for stop-loss / take-profit
+│   │       ├── data_feeds.py        # ccxt exchange factory + OHLCV fetcher
+│   │       ├── sentiment_service.py # RSS + Reddit + Fear & Greed sentiment scoring
+│   │       ├── ai_service.py        # Claude API call + prompt + response validation
+│   │       ├── risk_service.py      # Position tracking + risk rule enforcement
+│   │       ├── execution_service.py # Paper / live order placement
+│   │       └── trading_cycle.py     # Hourly orchestrator
 │   ├── .env.example
 │   └── requirements.txt
-├── docs/                           # This documentation
+├── dashboard/                       # Next.js monitoring UI
+│   ├── app/
+│   │   ├── layout.tsx               # Root layout — sidebar shell + ThemeProvider
+│   │   ├── page.tsx                 # Overview page (Dashboard + CandlestickChart)
+│   │   └── components/
+│   │       ├── app-sidebar.tsx      # Sidebar: brand, nav, bot status
+│   │       ├── dashboard.tsx        # Stats, decisions table, positions, assets
+│   │       └── candlestick-chart.tsx# TradingView live candlestick chart
+│   ├── hooks/
+│   │   └── use-chart-ws.ts          # WebSocket hook with exponential backoff reconnect
+│   ├── lib/
+│   │   ├── chart-utils.ts           # fmtPrice, fmtChange, autoDecimals
+│   │   └── utils.ts                 # shadcn cn() helper
+│   └── next.config.mjs              # Proxy: /api/bot/* and /api/chart/* → localhost:8000
+├── docs/                            # This documentation
 └── CLAUDE.md
 ```

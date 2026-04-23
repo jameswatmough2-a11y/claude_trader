@@ -207,6 +207,148 @@ GET http://localhost:8000/decisions
 
 ---
 
+---
+
+### `GET /market`
+
+Returns the current live market state for all tracked symbols, read directly from the in-memory `MarketStateStore`. Data is updated on every Binance WebSocket tick.
+
+**Route:** `app/api/routes/market.py`
+
+**Example response:**
+```json
+{
+  "BTCUSDT": {
+    "symbol": "BTCUSDT",
+    "price": 83421.50,
+    "bid": 83420.00,
+    "ask": 83423.00,
+    "change_24h_pct": 1.42,
+    "high_24h": 84100.00,
+    "low_24h": 81500.00,
+    "updated_at": "2026-04-23T14:00:01.123456+00:00",
+    "position": {
+      "entry_price": 82000.00,
+      "size_pct": 20,
+      "stop_loss_price": 80360.00,
+      "take_profit_price": null
+    }
+  },
+  "ETHUSDT": {
+    "symbol": "ETHUSDT",
+    "price": 2379.86,
+    "position": null,
+    ...
+  }
+}
+```
+
+**The `position` field** is non-null when an open position exists for that symbol. It is computed from `RiskService._positions` and the configured `STOP_LOSS_PCT` / `TAKE_PROFIT_PCT`. The dashboard uses this to draw reference lines on the price chart.
+
+**Notes:**
+- Returns an empty object `{}` before the WebSocket has received its first tick.
+- Used by the old Recharts line chart. The TradingView chart uses `GET /chart/history` + `WS /ws/chart` instead.
+
+---
+
+### `GET /chart/history`
+
+Returns historical OHLCV candlestick data for a symbol and interval. Used to seed the TradingView chart with historical bars before switching to the live WebSocket feed.
+
+**Route:** `app/api/routes/chart.py`
+
+**Query parameters:**
+
+| Parameter | Default | Allowed values |
+|---|---|---|
+| `symbol` | `BTCUSDT` | Any Binance symbol |
+| `interval` | `1m` | `1m` `3m` `5m` `15m` `30m` `1h` `2h` `4h` `6h` `12h` `1d` `1w` |
+
+**Example request:**
+```
+GET http://localhost:8000/chart/history?symbol=ETHUSDT&interval=5m
+```
+
+**Example response:**
+```json
+{
+  "symbol": "ETHUSDT",
+  "interval": "5m",
+  "candles": [
+    { "time": 1745366400, "open": 2371.20, "high": 2385.00, "low": 2368.50, "close": 2379.86, "volume": 1243.7 },
+    ...
+  ]
+}
+```
+
+`time` is a Unix timestamp in **seconds** (UTC), as required by TradingView Lightweight Charts. Up to 200 candles are returned (100 for `1w`).
+
+**Implementation:** fetches via `ccxt.binance.fetch_ohlcv()` run in a thread (`asyncio.to_thread`) so the event loop is not blocked.
+
+---
+
+### `WS /ws/chart`
+
+A WebSocket endpoint that streams real-time candlestick updates for a subscribed symbol. Unlike the REST endpoint, this pushes the current incomplete candle as it builds tick-by-tick.
+
+**Route:** `app/api/routes/chart.py`
+
+#### Subscribe
+
+After connecting, send a subscribe message to begin receiving data:
+
+```json
+{ "type": "subscribe", "symbol": "BTCUSDT", "interval": "1m" }
+```
+
+The server immediately responds with the current open position (if any) and then begins streaming candle and price updates.
+
+#### Server → Client message types
+
+**`candle`** — the current live OHLCV bar, sent whenever the price changes (max 5 Hz):
+```json
+{
+  "type": "candle",
+  "data": {
+    "time": 1745366400,
+    "open": 83400.00,
+    "high": 83450.00,
+    "low": 83390.00,
+    "close": 83421.50,
+    "volume": 0.0
+  }
+}
+```
+
+Pass `data` directly to `series.update()` in TradingView Lightweight Charts. TradingView updates the current bar in place if `time` matches the last bar, or appends a new bar when the interval rolls over.
+
+**`price`** — the latest tick price and 24h change, for the header display:
+```json
+{ "type": "price", "price": 83421.50, "change_24h_pct": 1.42 }
+```
+
+**`position`** — sent once on subscribe if an open position exists for the symbol:
+```json
+{
+  "type": "position",
+  "entry_price": 82000.00,
+  "stop_loss_price": 80360.00,
+  "take_profit_price": null,
+  "size_pct": 20
+}
+```
+
+The dashboard uses this to draw `IPriceLine` annotations on the chart.
+
+#### Implementation notes
+
+- The server polls `MarketStateStore.get(symbol)` every 200 ms and only sends a `candle` message when the price has changed since the last poll.
+- Candle boundaries are computed as `floor(now / interval_seconds) * interval_seconds`. When the current time crosses a boundary, a new candle starts.
+- Volume is always `0.0` — the Binance ticker stream does not provide per-tick volume.
+- The connection loop uses `asyncio.wait_for(ws.receive_json(), timeout=0.05)` so it can push updates without being blocked waiting for client messages.
+
+---
+
 ## Interactive Documentation
 
 FastAPI automatically generates:
@@ -229,23 +371,25 @@ To add a new endpoint:
    app.include_router(snapshots_router)
    ```
 
-To expose live position state (in-memory, from `RiskService`):
+To expose live in-memory state, import from `app/state.py` (never from `main.py` — circular import):
+
 ```python
-# In a new route file:
-from app.main import risk_service  # import the singleton
+# app/api/routes/live_positions.py
+from fastapi import APIRouter
+from app.state import risk_service
+
+router = APIRouter(tags=["positions"])
 
 @router.get("/live-positions")
 def live_positions():
-    positions = risk_service.get_open_positions()
     return [
         {
-            "asset": p.asset,
-            "entry_price": p.entry_price,
-            "size_pct": p.size_pct,
-            "current_price": p.current_price,
+            "symbol": sym,
+            "entry_price": pos.entry_price,
+            "size_pct": pos.size_pct,
         }
-        for p in positions.values()
+        for sym, pos in risk_service.get_open_positions().items()
     ]
 ```
 
-Note: importing `risk_service` from `main.py` creates a circular dependency risk if the route module itself is imported by `main.py`. The cleanest solution is to store service singletons in a separate `app/state.py` module.
+`app/state.py` holds all service singletons (`market_store`, `risk_service`, `execution_service`, etc.) and is safe to import from any route module.

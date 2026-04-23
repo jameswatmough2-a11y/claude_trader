@@ -1,6 +1,6 @@
-import { PriceChart } from '@/app/components/price-chart'
+import { CandlestickChart } from '@/app/components/candlestick-chart'
 import { Dashboard } from '@/app/components/dashboard'
 
 export default function Page() {
-  return <Dashboard priceChart={<PriceChart />} />
+  return <Dashboard priceChart={<CandlestickChart />} />
 }

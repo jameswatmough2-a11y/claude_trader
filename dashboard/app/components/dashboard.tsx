@@ -1,7 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useState } from 'react'
-import { Activity, Bot, Layers, RefreshCw, Zap } from 'lucide-react'
+import { Activity, Layers, RefreshCw, Zap } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -75,6 +75,30 @@ async function fetchAll(): Promise<BotData> {
 
 // ── Sub-components ────────────────────────────────────────────────────────────
 
+function FilterPill({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean
+  onClick: () => void
+  children: React.ReactNode
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={cn(
+        'rounded px-2 py-0.5 text-xs font-medium transition-colors',
+        active
+          ? 'bg-secondary text-secondary-foreground'
+          : 'text-muted-foreground hover:bg-secondary/50 hover:text-foreground',
+      )}
+    >
+      {children}
+    </button>
+  )
+}
+
 function ActionBadge({ action }: { action: string }) {
   const variant =
     action === 'BUY' ? 'default' :
@@ -88,11 +112,8 @@ function ConfidenceCell({ value }: { value: number | null }) {
   const pct = Math.round(value * 100)
   return (
     <div className="flex items-center gap-2">
-      <Progress value={pct} className="w-16 h-1.5" />
-      <span className={cn(
-        'tabular-nums text-xs font-medium',
-        pct < 60 && 'text-muted-foreground',
-      )}>
+      <Progress value={pct} className="h-1.5 w-16" />
+      <span className={cn('text-xs font-medium tabular-nums', pct < 60 && 'text-muted-foreground')}>
         {pct}%
       </span>
     </div>
@@ -116,7 +137,7 @@ function SkeletonRows({ rows, cols }: { rows: number; cols: number }) {
 function EmptyRow({ cols, message }: { cols: number; message: string }) {
   return (
     <TableRow>
-      <TableCell colSpan={cols} className="h-20 text-center text-sm text-muted-foreground">
+      <TableCell colSpan={cols} className="h-16 text-center text-sm text-muted-foreground">
         {message}
       </TableCell>
     </TableRow>
@@ -124,22 +145,14 @@ function EmptyRow({ cols, message }: { cols: number; message: string }) {
 }
 
 function StatCard({
-  title,
-  value,
-  sub,
-  icon,
-  loading,
+  title, value, sub, icon, loading,
 }: {
-  title: string
-  value: string | null
-  sub?: string
-  icon: React.ReactNode
-  loading: boolean
+  title: string; value: string | null; sub?: string; icon: React.ReactNode; loading: boolean
 }) {
   return (
     <Card>
       <CardHeader className="flex flex-row items-center justify-between pb-2">
-        <CardTitle className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+        <CardTitle className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
           {title}
         </CardTitle>
         {icon}
@@ -149,13 +162,17 @@ function StatCard({
           <Skeleton className="h-6 w-3/4" />
         ) : (
           <>
-            <p className="text-base font-semibold truncate">{value ?? '—'}</p>
-            {sub && <p className="text-xs text-muted-foreground mt-0.5">{sub}</p>}
+            <p className="truncate text-base font-semibold">{value ?? '—'}</p>
+            {sub && <p className="mt-0.5 text-xs text-muted-foreground">{sub}</p>}
           </>
         )}
       </CardContent>
     </Card>
   )
+}
+
+function Divider() {
+  return <div className="h-3 w-px bg-border" />
 }
 
 function formatTime(iso: string) {
@@ -173,6 +190,14 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
+
+  // Decisions filters
+  const [decisionCycle, setDecisionCycle] = useState<'latest' | 'all'>('latest')
+  const [decisionSymbol, setDecisionSymbol] = useState<string>('ALL')
+  const [decisionAction, setDecisionAction] = useState<string>('ALL')
+
+  // Positions filter
+  const [positionView, setPositionView] = useState<'latest' | 'all'>('latest')
 
   const load = useCallback(async (isRefresh = false) => {
     if (isRefresh) setRefreshing(true)
@@ -195,53 +220,53 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
     return () => clearInterval(id)
   }, [load])
 
-  // The latest cycle shares the same snapshot_time as the first decision in the list
-  // (decisions come back newest-first from the updated API).
-  const latestSnapshotTime = data?.decisions[0]?.snapshot_time ?? null
+  // ── Derived data ────────────────────────────────────────────────────────────
 
-  const latestDecisions = data?.decisions ?? []
-  // Deduplicate to show one position record per symbol from latest cycle only
-  const latestPositionTime = data?.positions[0]?.snapshot_time ?? null
+  const allDecisions = data?.decisions ?? []
+  const latestSnapshotTime = allDecisions[0]?.snapshot_time ?? null
+
+  // Unique symbols and actions present in decisions (for dynamic filter pills)
+  const decisionSymbols = [...new Set(allDecisions.map(d => d.symbol))]
+  const availableActions = ['BUY', 'SELL', 'HOLD'] as const
+
+  // Apply decisions filters
+  let filteredDecisions = allDecisions
+  if (decisionCycle === 'latest' && latestSnapshotTime) {
+    filteredDecisions = filteredDecisions.filter(d => d.snapshot_time === latestSnapshotTime)
+  }
+  if (decisionSymbol !== 'ALL') {
+    filteredDecisions = filteredDecisions.filter(d => d.symbol === decisionSymbol)
+  }
+  if (decisionAction !== 'ALL') {
+    filteredDecisions = filteredDecisions.filter(d => d.action === decisionAction)
+  }
+
+  // Positions: latest = one row per symbol (newest first, deduplicated)
+  const allPositions = data?.positions ?? []
+  const latestPositionTime = allPositions[0]?.snapshot_time ?? null
+  const latestPositions = (() => {
+    const seen = new Set<string>()
+    return allPositions.filter(p => {
+      if (seen.has(p.symbol)) return false
+      seen.add(p.symbol)
+      return true
+    })
+  })()
+  const shownPositions = positionView === 'latest' ? latestPositions : allPositions
 
   return (
-    <div className="flex flex-col gap-6 p-6 max-w-7xl mx-auto min-h-screen">
+    <div className="mx-auto flex min-h-screen max-w-7xl flex-col gap-6 p-6">
 
       {/* ── Header ─────────────────────────────────────────────────────── */}
       <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <Bot className="size-5 text-primary" />
-          <h1 className="text-xl font-semibold tracking-tight">Claude Trader</h1>
-          {!loading && data && (
-            <Badge variant={data.health.paper_trading ? 'outline' : 'default'}>
-              {data.health.paper_trading ? 'Paper Trading' : 'Live Trading'}
-            </Badge>
-          )}
-          {!loading && (
-            <span className={cn(
-              'flex items-center gap-1.5 text-xs',
-              error ? 'text-destructive' : 'text-muted-foreground',
-            )}>
-              <span className={cn(
-                'inline-block size-1.5 rounded-full',
-                error ? 'bg-destructive' : 'bg-green-500',
-              )} />
-              {error ? 'Offline' : 'Online'}
-            </span>
-          )}
-        </div>
-
+        <h1 className="text-base font-semibold">Overview</h1>
         <div className="flex items-center gap-3">
           {lastUpdated && (
-            <span className="text-xs text-muted-foreground hidden sm:block">
+            <span className="hidden text-xs text-muted-foreground sm:block">
               Updated {lastUpdated.toLocaleTimeString()}
             </span>
           )}
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => load(true)}
-            disabled={refreshing}
-          >
+          <Button variant="outline" size="sm" onClick={() => load(true)} disabled={refreshing}>
             <RefreshCw data-icon="inline-start" className={cn(refreshing && 'animate-spin')} />
             Refresh
           </Button>
@@ -251,7 +276,7 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
       {/* ── Error banner ───────────────────────────────────────────────── */}
       {error && (
         <Card className="border-destructive/50 bg-destructive/5">
-          <CardContent className="flex flex-col gap-1 pt-4 pb-4">
+          <CardContent className="flex flex-col gap-1 pb-4 pt-4">
             <p className="text-sm font-medium text-destructive">{error}</p>
             <p className="text-xs text-muted-foreground">
               Start the server: <code className="font-mono">cd crypto_bot && uvicorn app.main:app --reload</code>
@@ -278,8 +303,8 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
         />
         <StatCard
           title="Total Decisions"
-          value={data ? String(data.decisions.length) : null}
-          sub={data ? `${Math.round(data.decisions.length / Math.max(data.health.tracked_symbols.length, 1))} cycles` : undefined}
+          value={data ? String(allDecisions.length) : null}
+          sub={data ? `${Math.round(allDecisions.length / Math.max(data.health.tracked_symbols.length, 1))} cycles` : undefined}
           icon={<Activity className="size-4 text-muted-foreground" />}
           loading={loading}
         />
@@ -292,13 +317,13 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
         />
       </div>
 
-      {/* ── Live price chart (injected from page) ─────────────────────── */}
+      {/* ── Live price chart ───────────────────────────────────────────── */}
       {priceChart}
 
       {/* ── Decisions table ────────────────────────────────────────────── */}
       <Card>
         <CardHeader className="pb-3">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-start justify-between gap-2">
             <CardTitle>AI Decisions</CardTitle>
             {latestSnapshotTime && (
               <span className="text-xs text-muted-foreground">
@@ -306,10 +331,44 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
               </span>
             )}
           </div>
-          <p className="text-sm text-muted-foreground">
-            Claude&apos;s hourly recommendations, newest first. Highlighted rows are the current cycle.
-          </p>
+
+          {/* Filter bar */}
+          <div className="flex flex-wrap items-center gap-3 pt-1">
+            {/* Cycle scope */}
+            <div className="flex items-center gap-1">
+              <FilterPill active={decisionCycle === 'latest'} onClick={() => setDecisionCycle('latest')}>Latest</FilterPill>
+              <FilterPill active={decisionCycle === 'all'} onClick={() => setDecisionCycle('all')}>All cycles</FilterPill>
+            </div>
+
+            {decisionSymbols.length > 0 && (
+              <>
+                <Divider />
+                {/* Symbol filter */}
+                <div className="flex items-center gap-1">
+                  <FilterPill active={decisionSymbol === 'ALL'} onClick={() => setDecisionSymbol('ALL')}>All</FilterPill>
+                  {decisionSymbols.map(s => (
+                    <FilterPill key={s} active={decisionSymbol === s} onClick={() => setDecisionSymbol(s)}>
+                      {s.replace('USDT', '')}
+                    </FilterPill>
+                  ))}
+                </div>
+
+                <Divider />
+
+                {/* Action filter */}
+                <div className="flex items-center gap-1">
+                  <FilterPill active={decisionAction === 'ALL'} onClick={() => setDecisionAction('ALL')}>All</FilterPill>
+                  {availableActions.map(a => (
+                    <FilterPill key={a} active={decisionAction === a} onClick={() => setDecisionAction(a)}>
+                      {a}
+                    </FilterPill>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
         </CardHeader>
+
         <CardContent className="p-0">
           <Table>
             <TableHeader>
@@ -318,33 +377,39 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
                 <TableHead>Action</TableHead>
                 <TableHead>Confidence</TableHead>
                 <TableHead className="hidden md:table-cell">Reasoning</TableHead>
-                <TableHead className="text-right hidden sm:table-cell">Time</TableHead>
+                <TableHead className="hidden text-right sm:table-cell">Time</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {loading ? (
                 <SkeletonRows rows={3} cols={5} />
-              ) : latestDecisions.length === 0 ? (
-                <EmptyRow cols={5} message="No decisions yet — waiting for the first trading cycle to complete." />
+              ) : filteredDecisions.length === 0 ? (
+                <EmptyRow
+                  cols={5}
+                  message={
+                    allDecisions.length === 0
+                      ? 'No decisions yet — waiting for the first trading cycle.'
+                      : 'No decisions match the current filters.'
+                  }
+                />
               ) : (
-                latestDecisions.map(d => (
+                filteredDecisions.map(d => (
                   <TableRow
                     key={d.id}
-                    className={cn(d.snapshot_time === latestSnapshotTime && 'bg-muted/40')}
+                    className={cn(
+                      decisionCycle === 'all' && d.snapshot_time === latestSnapshotTime && 'bg-muted/40',
+                    )}
                   >
-                    <TableCell className="font-mono font-medium text-sm">
-                      {d.symbol}
+                    <TableCell className="font-mono text-sm font-medium">
+                      {d.symbol.replace('USDT', '')}
+                      <span className="text-muted-foreground">/USDT</span>
                     </TableCell>
-                    <TableCell>
-                      <ActionBadge action={d.action} />
+                    <TableCell><ActionBadge action={d.action} /></TableCell>
+                    <TableCell><ConfidenceCell value={d.confidence_score} /></TableCell>
+                    <TableCell className="hidden max-w-sm text-sm text-muted-foreground md:table-cell">
+                      <span className="line-clamp-1">{d.reasoning_summary ?? '—'}</span>
                     </TableCell>
-                    <TableCell>
-                      <ConfidenceCell value={d.confidence_score} />
-                    </TableCell>
-                    <TableCell className="hidden md:table-cell text-sm text-muted-foreground max-w-xs">
-                      <span className="line-clamp-2">{d.reasoning_summary ?? '—'}</span>
-                    </TableCell>
-                    <TableCell className="text-right text-xs text-muted-foreground tabular-nums hidden sm:table-cell whitespace-nowrap">
+                    <TableCell className="hidden whitespace-nowrap text-right text-xs text-muted-foreground tabular-nums sm:table-cell">
                       {formatTime(d.snapshot_time)}
                     </TableCell>
                   </TableRow>
@@ -352,6 +417,21 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
               )}
             </TableBody>
           </Table>
+
+          {/* Row count footer */}
+          {!loading && allDecisions.length > 0 && (
+            <div className="border-t px-4 py-2 text-xs text-muted-foreground">
+              Showing {filteredDecisions.length} of {allDecisions.length} decisions
+              {decisionCycle === 'latest' && allDecisions.length > filteredDecisions.length && (
+                <button
+                  className="ml-2 font-medium text-foreground hover:underline"
+                  onClick={() => setDecisionCycle('all')}
+                >
+                  Show all
+                </button>
+              )}
+            </div>
+          )}
         </CardContent>
       </Card>
 
@@ -361,7 +441,13 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
         {/* Positions */}
         <Card className="md:col-span-3">
           <CardHeader className="pb-3">
-            <CardTitle>Positions</CardTitle>
+            <div className="flex items-center justify-between">
+              <CardTitle>Positions</CardTitle>
+              <div className="flex items-center gap-1">
+                <FilterPill active={positionView === 'latest'} onClick={() => setPositionView('latest')}>Latest</FilterPill>
+                <FilterPill active={positionView === 'all'} onClick={() => setPositionView('all')}>History</FilterPill>
+              </div>
+            </div>
             <p className="text-sm text-muted-foreground">
               Wallet balance snapshots per cycle. Live position tracking is in-memory only.
             </p>
@@ -378,19 +464,24 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
               <TableBody>
                 {loading ? (
                   <SkeletonRows rows={3} cols={3} />
-                ) : (data?.positions ?? []).length === 0 ? (
+                ) : shownPositions.length === 0 ? (
                   <EmptyRow cols={3} message="No position records yet." />
                 ) : (
-                  (data?.positions ?? []).map(p => (
+                  shownPositions.map(p => (
                     <TableRow
                       key={p.id}
-                      className={cn(p.snapshot_time === latestPositionTime && 'bg-muted/40')}
+                      className={cn(
+                        positionView === 'all' && p.snapshot_time === latestPositionTime && 'bg-muted/40',
+                      )}
                     >
-                      <TableCell className="font-mono font-medium text-sm">{p.symbol}</TableCell>
-                      <TableCell className="text-xs text-muted-foreground whitespace-nowrap">
+                      <TableCell className="font-mono text-sm font-medium">
+                        {p.symbol.replace('USDT', '')}
+                        <span className="text-muted-foreground">/USDT</span>
+                      </TableCell>
+                      <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
                         {formatTime(p.snapshot_time)}
                       </TableCell>
-                      <TableCell className="text-right tabular-nums text-sm">
+                      <TableCell className="text-right text-sm tabular-nums">
                         {p.wallet_balance != null
                           ? `$${p.wallet_balance.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
                           : '—'}
@@ -400,6 +491,19 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
                 )}
               </TableBody>
             </Table>
+
+            {/* Row count footer */}
+            {!loading && allPositions.length > 0 && positionView === 'latest' && allPositions.length > latestPositions.length && (
+              <div className="border-t px-4 py-2 text-xs text-muted-foreground">
+                Showing {latestPositions.length} of {allPositions.length} records
+                <button
+                  className="ml-2 font-medium text-foreground hover:underline"
+                  onClick={() => setPositionView('all')}
+                >
+                  Show history
+                </button>
+              </div>
+            )}
           </CardContent>
         </Card>
 
@@ -426,7 +530,7 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
                 ) : (
                   (data?.assets ?? []).map(a => (
                     <TableRow key={a.id}>
-                      <TableCell className="font-mono font-medium text-sm">{a.symbol}</TableCell>
+                      <TableCell className="font-mono text-sm font-medium">{a.symbol}</TableCell>
                       <TableCell className="font-mono text-sm text-muted-foreground">{a.base_currency}</TableCell>
                       <TableCell className="font-mono text-sm text-muted-foreground">{a.quote_currency}</TableCell>
                     </TableRow>
@@ -440,8 +544,9 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
       </div>
 
       {/* ── Footer ─────────────────────────────────────────────────────── */}
-      <p className="text-center text-xs text-muted-foreground pb-4">
-        Auto-refreshes every 30 seconds · Press <kbd className="font-mono bg-muted px-1 rounded text-xs">d</kbd> to toggle dark mode
+      <p className="pb-4 text-center text-xs text-muted-foreground">
+        Auto-refreshes every 30 seconds · Press{' '}
+        <kbd className="rounded bg-muted px-1 font-mono text-xs">d</kbd> to toggle dark mode
       </p>
 
     </div>
