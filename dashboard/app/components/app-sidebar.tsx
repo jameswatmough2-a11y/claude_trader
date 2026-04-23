@@ -1,7 +1,9 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import { Activity, Bot, LayoutDashboard, RefreshCw, Zap } from 'lucide-react'
+import Link from 'next/link'
+import { usePathname } from 'next/navigation'
+import { Activity, Bot, LayoutDashboard, RefreshCw, Settings, Zap } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
 import { Separator } from '@/components/ui/separator'
@@ -29,6 +31,32 @@ function fmtCycleTime(iso: string) {
     hour: '2-digit',
     minute: '2-digit',
   })
+}
+
+function NavLink({
+  href,
+  icon,
+  children,
+}: {
+  href: string
+  icon: React.ReactNode
+  children: React.ReactNode
+}) {
+  const pathname = usePathname()
+  const active = pathname === href || (href !== '/' && pathname.startsWith(href))
+  return (
+    <Link href={href}>
+      <div className={cn(
+        'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition-colors',
+        active
+          ? 'bg-secondary text-secondary-foreground'
+          : 'text-muted-foreground hover:bg-secondary/50 hover:text-foreground',
+      )}>
+        {icon}
+        {children}
+      </div>
+    </Link>
+  )
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -88,10 +116,12 @@ export function AppSidebar() {
 
       {/* ── Navigation ─────────────────────────────────────────────────── */}
       <nav className="flex flex-col gap-0.5 p-2">
-        <div className="flex items-center gap-2 rounded-md bg-secondary px-3 py-2 text-sm font-medium text-secondary-foreground">
-          <LayoutDashboard className="size-4" />
+        <NavLink href="/" icon={<LayoutDashboard className="size-4" />}>
           Overview
-        </div>
+        </NavLink>
+        <NavLink href="/settings" icon={<Settings className="size-4" />}>
+          Settings
+        </NavLink>
       </nav>
 
       <Separator />
@@ -102,7 +132,6 @@ export function AppSidebar() {
           Status
         </p>
 
-        {/* Online / offline indicator */}
         <div className="flex items-center gap-2">
           {online === null ? (
             <span className="inline-block size-1.5 rounded-full bg-muted-foreground" />

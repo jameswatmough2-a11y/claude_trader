@@ -7,6 +7,10 @@ single location without creating circular imports.
 from __future__ import annotations
 
 import asyncio
+import logging
+from dataclasses import dataclass
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app.config import settings
 from app.services.market_state import MarketStateStore
@@ -15,6 +19,8 @@ from app.services.execution_service import ExecutionService
 from app.services.trading_cycle import TradingCycleService
 from app.services.binance_ws import BinanceWebSocketService
 from app.services.trigger_executor import TriggerExecutor
+
+logger = logging.getLogger(__name__)
 
 trigger_queue: asyncio.Queue = asyncio.Queue()
 
@@ -36,3 +42,23 @@ trigger_executor = TriggerExecutor(
     queue=trigger_queue,
     execution_service=execution_service,
 )
+
+
+@dataclass
+class BotState:
+    running: bool = False
+
+
+bot_state = BotState()
+scheduler = AsyncIOScheduler(timezone="UTC")
+
+
+async def run_hourly_cycle() -> None:
+    from app.db.session import SessionLocal
+    db = SessionLocal()
+    try:
+        await asyncio.to_thread(trading_cycle_service.run, db)
+    except Exception:
+        logger.exception("Unhandled error in hourly trading cycle")
+    finally:
+        db.close()

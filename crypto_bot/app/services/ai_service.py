@@ -12,27 +12,6 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are a disciplined crypto trading analyst. Evaluate the market and
-sentiment data provided, then return a single JSON array of trading decisions — one object
-per asset. Never deviate from the schema below.
-
-Decision schema:
-{
-  "asset":      "<SYMBOL>",
-  "action":     "BUY" | "SELL" | "HOLD",
-  "confidence": <float 0.0–1.0>,
-  "size_pct":   <int 0–20>,
-  "reasoning":  "<one-sentence rationale>"
-}
-
-Rules:
-- Return ONLY a valid JSON array. No markdown, no extra text.
-- size_pct must be 0 when action is HOLD.
-- size_pct maximum is 20 for any single asset.
-- If confidence < 0.7, set action to HOLD and size_pct to 0.
-- Base decisions solely on the data provided.
-"""
-
 _client: anthropic.Anthropic | None = None
 
 
@@ -45,15 +24,62 @@ def _get_client() -> anthropic.Anthropic:
     return _client
 
 
-def _build_prompt(market_data: dict[str, Any], sentiment_data: dict[str, Any]) -> str:
+def _build_system_prompt() -> str:
+    min_conf = settings.min_confidence
+    max_pos = int(settings.max_position_pct)
+    return f"""You are a disciplined crypto trading analyst. Evaluate the provided market and sentiment data, then return a JSON array of trading decisions — one object per asset.
+
+Decision schema (strict):
+{{
+  "asset":      "<SYMBOL>",
+  "action":     "BUY" | "SELL" | "HOLD",
+  "confidence": <float 0.0–1.0>,
+  "size_pct":   <int 0–{max_pos}>,
+  "reasoning":  "<one-sentence rationale>"
+}}
+
+Rules:
+- Return ONLY a valid JSON array. No markdown, no explanation, no extra text.
+- size_pct must be 0 for HOLD and SELL actions.
+- size_pct maximum is {max_pos} for BUY actions.
+- Only recommend BUY or SELL when confidence ≥ {min_conf:.2f}. Below that threshold, use HOLD.
+- If a position is currently OPEN for an asset: you may recommend SELL (to exit) or HOLD (to keep it). Do NOT recommend BUY on an already-open position.
+- If NO position is open for an asset: you may recommend BUY (to enter) or HOLD (to stay flat). Do NOT recommend SELL on an asset with no position.
+- Be willing to act — HOLD everything is not a useful response if the data supports a trade."""
+
+
+def _build_prompt(
+    market_data: dict[str, Any],
+    sentiment_data: dict[str, Any],
+    open_positions: dict[str, Any] | None = None,
+) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines: list[str] = [
         f"=== HOURLY TRADING ANALYSIS — {now} ===",
         "",
-        "Analyse the following data and return one JSON decision per asset.",
-        "",
     ]
 
+    # Current position context — critical for SELL decisions
+    lines.append("=== CURRENT POSITIONS ===")
+    if not open_positions:
+        lines.append("No open positions — all assets are currently flat.")
+    else:
+        for symbol in (list(market_data.keys()) or settings.tracked_symbols):
+            pos = open_positions.get(symbol.upper())
+            if pos is not None:
+                pnl_pct = (
+                    (pos.current_price - pos.entry_price) / pos.entry_price * 100
+                    if pos.entry_price > 0 else 0.0
+                )
+                lines.append(
+                    f"  {symbol}: LONG {pos.size_pct:.0f}% @ ${pos.entry_price:,.4f} "
+                    f"(current ${pos.current_price:,.4f}, {pnl_pct:+.2f}% PnL)"
+                )
+            else:
+                lines.append(f"  {symbol}: flat — no position")
+    lines.append("")
+
+    lines.append("=== MARKET DATA ===")
     symbols = list(market_data.keys()) or settings.tracked_symbols
     for symbol in symbols:
         lines.append(f"--- {symbol} ---")
@@ -78,10 +104,10 @@ def _build_prompt(market_data: dict[str, Any], sentiment_data: dict[str, Any]) -
                 f"Quote Volume: ${float(md.get('quote_volume_24h', 0) or 0):,.0f}"
             )
 
-        candles = ohlcv.get("candles", [])
-        if candles:
-            recent_closes = " → ".join(f"${c['close']:,.2f}" for c in candles[-6:])
-            lines.append(f"Last 6h closes: {recent_closes}")
+            candles = ohlcv.get("candles", [])
+            if candles:
+                recent_closes = " → ".join(f"${c['close']:,.2f}" for c in candles[-6:])
+                lines.append(f"Last 6h closes: {recent_closes}")
 
         sent = sentiment_data.get(symbol)
         if sent:
@@ -95,12 +121,11 @@ def _build_prompt(market_data: dict[str, Any], sentiment_data: dict[str, Any]) -
 
         lines.append("")
 
-    lines.append("Return ONLY a JSON array.")
+    lines.append("Return ONLY a JSON array with one decision per asset listed above.")
     return "\n".join(lines)
 
 
 def _extract_json(text: str) -> str:
-    """Strip markdown fences and extract the JSON array from a response."""
     text = text.strip()
     if text.startswith("```"):
         text = "\n".join(
@@ -114,6 +139,7 @@ def _validate_decisions(raw: list[Any], symbols: list[str]) -> list[dict[str, An
     required = {"asset", "action", "confidence", "size_pct", "reasoning"}
     valid_actions = {"BUY", "SELL", "HOLD"}
     valid_assets = {s.upper() for s in symbols}
+    max_pos = int(settings.max_position_pct)
     validated: list[dict[str, Any]] = []
 
     for item in raw:
@@ -123,16 +149,21 @@ def _validate_decisions(raw: list[Any], symbols: list[str]) -> list[dict[str, An
         asset = str(item["asset"]).upper()
         action = str(item["action"]).upper()
         confidence = max(0.0, min(1.0, float(item["confidence"])))
-        size_pct = max(0, min(20, int(item["size_pct"])))
+        size_pct = max(0, min(max_pos, int(item["size_pct"])))
         reasoning = str(item["reasoning"])
 
         if asset not in valid_assets:
             continue
         if action not in valid_actions:
             action = "HOLD"
-        if confidence < settings.min_confidence:
+
+        if confidence < settings.min_confidence and action != "HOLD":
+            reasoning = (
+                f"Confidence {confidence:.2f} below threshold {settings.min_confidence:.2f} — overridden to HOLD."
+            )
             action, size_pct = "HOLD", 0
-        if action == "HOLD":
+
+        if action in ("HOLD", "SELL"):
             size_pct = 0
 
         validated.append({
@@ -160,15 +191,16 @@ def _validate_decisions(raw: list[Any], symbols: list[str]) -> list[dict[str, An
 def get_trading_decisions(
     market_data: dict[str, Any],
     sentiment_data: dict[str, Any],
+    open_positions: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     symbols = list(market_data.keys()) or settings.tracked_symbols
     client = _get_client()
-    prompt = _build_prompt(market_data, sentiment_data)
+    prompt = _build_prompt(market_data, sentiment_data, open_positions)
 
     response = client.messages.create(
         model=settings.model_name,
         max_tokens=2048,
-        system=SYSTEM_PROMPT,
+        system=_build_system_prompt(),
         messages=[{"role": "user", "content": prompt}],
     )
 

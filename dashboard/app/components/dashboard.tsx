@@ -1,7 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useState } from 'react'
-import { Activity, Layers, RefreshCw, Zap } from 'lucide-react'
+import { Activity, Layers, PlayCircle, RefreshCw, RotateCcw, Square, Zap } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -54,23 +54,30 @@ interface Decision {
   reasoning_summary: string | null
 }
 
+interface BotStatus {
+  running: boolean
+  paper_trading: boolean
+}
+
 interface BotData {
   health: Health
   assets: Asset[]
   positions: Position[]
   decisions: Decision[]
+  status: BotStatus
 }
 
 // ── Data fetching ─────────────────────────────────────────────────────────────
 
 async function fetchAll(): Promise<BotData> {
-  const [health, assets, positions, decisions] = await Promise.all([
+  const [health, assets, positions, decisions, status] = await Promise.all([
     fetch('/api/bot/health').then(r => { if (!r.ok) throw new Error(r.statusText); return r.json() }),
     fetch('/api/bot/assets').then(r => r.json()),
     fetch('/api/bot/positions').then(r => r.json()),
     fetch('/api/bot/decisions').then(r => r.json()),
+    fetch('/api/bot/status').then(r => r.json()),
   ])
-  return { health, assets, positions, decisions }
+  return { health, assets, positions, decisions, status }
 }
 
 // ── Sub-components ────────────────────────────────────────────────────────────
@@ -190,6 +197,7 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
+  const [botAction, setBotAction] = useState<string | null>(null)
 
   // Decisions filters
   const [decisionCycle, setDecisionCycle] = useState<'latest' | 'all'>('latest')
@@ -213,6 +221,17 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
       setRefreshing(false)
     }
   }, [])
+
+  const botControl = useCallback(async (action: 'start' | 'stop' | 'reset') => {
+    if (action === 'reset' && !window.confirm('This will clear all trading history from the database. Continue?')) return
+    setBotAction(action)
+    try {
+      await fetch(`/api/bot/${action}`, { method: 'POST' })
+      await load()
+    } finally {
+      setBotAction(null)
+    }
+  }, [load])
 
   useEffect(() => {
     load()
@@ -272,6 +291,53 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
           </Button>
         </div>
       </div>
+
+      {/* ── Bot controls ───────────────────────────────────────────────── */}
+      <Card className={cn(
+        'border',
+        data?.status.running ? 'border-green-500/40 bg-green-500/5' : 'border-muted',
+      )}>
+        <CardContent className="flex flex-wrap items-center justify-between gap-3 py-3">
+          <div className="flex items-center gap-2.5">
+            <span className={cn(
+              'size-2 rounded-full',
+              data?.status.running ? 'bg-green-500 animate-pulse' : 'bg-muted-foreground/40',
+            )} />
+            <span className="text-sm font-medium">
+              {loading ? 'Loading…' : data?.status.running ? 'Bot Running' : 'Bot Stopped'}
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => botControl('start')}
+              disabled={loading || !!data?.status.running || botAction !== null}
+            >
+              <PlayCircle data-icon="inline-start" />
+              Start
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => botControl('stop')}
+              disabled={loading || !data?.status.running || botAction !== null}
+            >
+              <Square data-icon="inline-start" />
+              Stop
+            </Button>
+            <Button
+              variant="destructive"
+              size="sm"
+              onClick={() => botControl('reset')}
+              disabled={loading || botAction !== null}
+            >
+              <RotateCcw data-icon="inline-start" />
+              Reset DB
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
 
       {/* ── Error banner ───────────────────────────────────────────────── */}
       {error && (

@@ -1,14 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
 from typing import AsyncGenerator
 
 from fastapi import FastAPI
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.interval import IntervalTrigger
 
 from app.api.routes.health import router as health_router
 from app.api.routes.assets import router as assets_router
@@ -16,15 +12,15 @@ from app.api.routes.positions import router as positions_router
 from app.api.routes.decisions import router as decisions_router
 from app.api.routes.market import router as market_router
 from app.api.routes.chart import router as chart_router
-from app.config import settings
+from app.api.routes.bot_control import router as bot_control_router
 from app.db.init_db import init_db
 from app.db.session import SessionLocal
 from app.state import (
     ws_service,
     trigger_executor,
-    trading_cycle_service,
     risk_service,
     execution_service,
+    scheduler,
 )
 
 logging.basicConfig(
@@ -34,51 +30,35 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-scheduler = AsyncIOScheduler(timezone="UTC")
-
-
-async def run_hourly_cycle() -> None:
-    db = SessionLocal()
-    try:
-        await asyncio.to_thread(trading_cycle_service.run, db)
-    except Exception:
-        logger.exception("Unhandled error in hourly trading cycle")
-    finally:
-        db.close()
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    import asyncio
+
     init_db()
 
-    # Restore positions and paper balance from DB so state survives restarts
     db = SessionLocal()
     try:
         risk_service.restore_from_db(db)
         execution_service.restore_paper_balance_from_db(db)
+
+        # Apply persisted config to live settings so risk params survive restarts
+        from app.models.bot_config import BotConfig
+        from app.api.routes.bot_control import _apply_settings
+        row = db.get(BotConfig, 1)
+        if row:
+            _apply_settings(row)
     finally:
         db.close()
 
     asyncio.create_task(ws_service.run_forever())
     asyncio.create_task(trigger_executor.run_forever())
 
-    scheduler.add_job(
-        run_hourly_cycle,
-        trigger=IntervalTrigger(hours=1),
-        id="hourly_trading_cycle",
-        replace_existing=True,
-        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=10),
-    )
     scheduler.start()
+    logger.info("Scheduler started — waiting for user to press Start")
 
-    logger.info(
-        "Bot started — paper_trading=%s  symbols=%s  stop_loss=%.1f%%  take_profit=%.1f%%",
-        settings.paper_trading,
-        settings.tracked_symbols,
-        settings.stop_loss_pct,
-        settings.take_profit_pct,
-    )
     yield
+
     scheduler.shutdown(wait=False)
     logger.info("Bot stopped")
 
@@ -91,3 +71,4 @@ app.include_router(positions_router)
 app.include_router(decisions_router)
 app.include_router(market_router)
 app.include_router(chart_router)
+app.include_router(bot_control_router)

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from websockets.asyncio.client import connect
 
+from app.config import settings
 from app.services.market_state import MarketStateStore
 
 if TYPE_CHECKING:
@@ -24,19 +25,32 @@ class BinanceWebSocketService:
         risk_service: RiskService | None = None,
         trigger_queue: asyncio.Queue | None = None,
     ) -> None:
-        self.symbols = [s.lower() for s in symbols]
+        self._default_symbols = [s.lower() for s in symbols]
         self.market_store = market_store
         self._risk_service = risk_service
         self._trigger_queue = trigger_queue
+        self._ws = None
 
-        streams = "/".join(f"{s}@ticker" for s in self.symbols)
-        self.url = f"wss://data-stream.binance.vision/stream?streams={streams}"
+    def _build_url(self) -> str:
+        syms = settings.tracked_symbols or [s.upper() for s in self._default_symbols]
+        streams = "/".join(f"{s.lower()}@ticker" for s in syms)
+        return f"wss://data-stream.binance.vision/stream?streams={streams}"
+
+    async def reconnect(self) -> None:
+        """Close the active connection so run_forever reconnects with the current symbol list."""
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
 
     async def run_forever(self) -> None:
         while True:
             try:
-                logger.info("Connecting Binance WebSocket: %s", self.url)
-                async with connect(self.url, ping_interval=20, ping_timeout=60) as ws:
+                url = self._build_url()
+                logger.info("Connecting Binance WebSocket: %s", url)
+                async with connect(url, ping_interval=20, ping_timeout=60) as ws:
+                    self._ws = ws
                     async for message in ws:
                         self._handle_message(message)
             except asyncio.CancelledError:
@@ -44,6 +58,8 @@ class BinanceWebSocketService:
             except Exception as exc:
                 logger.exception("Binance WebSocket error — reconnecting in 5s: %s", exc)
                 await asyncio.sleep(5)
+            finally:
+                self._ws = None
 
     def _handle_message(self, message: str) -> None:
         payload = json.loads(message)

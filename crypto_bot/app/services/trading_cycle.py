@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 class TradingCycleService:
-    """Orchestrates the hourly trading loop: data → AI → risk → execution → persist."""
+    """Orchestrates the trading loop: data → AI → risk → execution → persist."""
 
     def __init__(
         self,
@@ -47,7 +47,8 @@ class TradingCycleService:
 
         self._enrich_with_ohlcv(market_data)
         sentiment_data = self._fetch_sentiment(symbols)
-        decisions = self._fetch_decisions(market_data, sentiment_data, symbols)
+        open_positions = self.risk_service.get_open_positions()
+        decisions = self._fetch_decisions(market_data, sentiment_data, open_positions)
         filtered = self.risk_service.filter_decisions(decisions, market_data)
 
         for decision in filtered:
@@ -67,9 +68,11 @@ class TradingCycleService:
     # ── Private helpers ────────────────────────────────────────────────────────
 
     def _build_market_data(self) -> dict[str, Any]:
-        """Convert live WebSocket state into the market-data dict used by AI/risk."""
+        tracked = {s.upper() for s in settings.tracked_symbols}
         result: dict[str, Any] = {}
         for symbol, state in self.market_store.all().items():
+            if symbol.upper() not in tracked:
+                continue
             if state.last_price is None:
                 continue
             price = float(state.last_price)
@@ -96,7 +99,6 @@ class TradingCycleService:
         return result
 
     def _enrich_with_ohlcv(self, market_data: dict[str, Any]) -> None:
-        """Fetch real 24-hourly candles from Binance and merge into market_data."""
         for symbol in list(market_data.keys()):
             try:
                 df = fetch_ohlcv(symbol, timeframe="1h", limit=24)
@@ -139,10 +141,11 @@ class TradingCycleService:
         self,
         market_data: dict[str, Any],
         sentiment_data: dict[str, Any],
-        symbols: list[str],
+        open_positions: dict[str, Any],
     ) -> list[dict[str, Any]]:
+        symbols = list(market_data.keys())
         try:
-            return get_trading_decisions(market_data, sentiment_data)
+            return get_trading_decisions(market_data, sentiment_data, open_positions)
         except Exception:
             logger.exception("AI decision call failed — defaulting all symbols to HOLD")
             return [
@@ -213,7 +216,6 @@ class TradingCycleService:
 
         exec_result = self.execution_service.execute_decision(decision, {symbol: md}, balance)
 
-        # Update position to reflect actual post-execution state from risk service
         pos = self.risk_service.get_open_positions().get(symbol)
         if pos is not None:
             position.side = "long"
@@ -222,7 +224,7 @@ class TradingCycleService:
             if pos.current_price > 0 and pos.entry_price > 0:
                 unrealized_pct = (pos.current_price - pos.entry_price) / pos.entry_price * 100
                 position.unrealized_pnl = Decimal(str(round(unrealized_pct, 4)))
-        # Update wallet balance to post-execution value
+
         post_balance = self._fetch_balance()
         position.wallet_balance = Decimal(str(post_balance.get("USDT", {}).get("total", 0)))
 

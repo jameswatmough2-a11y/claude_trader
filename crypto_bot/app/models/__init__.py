@@ -4,6 +4,7 @@ from .hourly_market_snapshot import HourlyMarketSnapshot
 from .position import Position
 from .ai_decision import AIDecision
 from .execution import Execution
+from .bot_config import BotConfig
 
 __all__ = [
     "Base",
@@ -12,4 +13,5 @@ __all__ = [
     "Position",
     "AIDecision",
     "Execution",
+    "BotConfig",
 ]
