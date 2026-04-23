@@ -54,6 +54,7 @@ class TradingCycleService:
         logger.info("Processing %d symbols: %s", len(symbols), symbols)
 
         self._enrich_and_store_ohlcv(market_data, db, cycle_id)
+        db.commit()  # release SQLite write lock before slow sentiment + AI phases
         sentiment_data = self._fetch_sentiment(symbols, cycle_id)
         open_positions = self.risk_service.get_open_positions()
         previous_decisions = self._fetch_previous_decisions(db, symbols)
@@ -120,7 +121,7 @@ class TradingCycleService:
         cycle_id: str,
     ) -> None:
         interval = settings.ohlcv_interval
-        limit = 50  # fetch 50 candles per cycle
+        limit = settings.ohlcv_limit
 
         for symbol in list(market_data.keys()):
             try:
@@ -156,7 +157,7 @@ class TradingCycleService:
                         inserted += 1
 
                 if inserted:
-                    db.flush()
+                    db.commit()  # release write lock before db_logger writes
                     logger.info("OHLCV: upserted %d new %s candles for %s", inserted, interval, symbol)
 
                 db_logger.log_info(

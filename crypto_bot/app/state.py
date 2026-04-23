@@ -47,6 +47,7 @@ trigger_executor = TriggerExecutor(
 @dataclass
 class BotState:
     running: bool = False
+    cycle_active: bool = False  # True while a cycle is mid-execution
 
 
 bot_state = BotState()
@@ -56,9 +57,11 @@ scheduler = AsyncIOScheduler(timezone="UTC")
 async def run_hourly_cycle() -> None:
     from app.db.session import SessionLocal
     db = SessionLocal()
+    bot_state.cycle_active = True
     try:
         await asyncio.to_thread(trading_cycle_service.run, db)
     except Exception:
         logger.exception("Unhandled error in hourly trading cycle")
     finally:
+        bot_state.cycle_active = False
         db.close()

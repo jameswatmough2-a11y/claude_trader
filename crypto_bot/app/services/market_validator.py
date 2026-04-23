@@ -61,14 +61,21 @@ def validate_and_normalize_qty(
     amount_limits = limits.get("amount") or {}
     cost_limits = limits.get("cost") or {}
 
-    # Step-size normalization using amount precision
+    # Step-size normalization using amount precision.
+    # ccxt returns precision either as decimal places count (e.g. 5) or as a
+    # step size float (e.g. 1e-05). Detect by value and convert accordingly.
     amount_precision = precision.get("amount")
     if amount_precision is not None:
         try:
-            ap = int(amount_precision)
-            factor = 10 ** ap
-            qty = math.floor(qty * factor) / factor
-        except (TypeError, ValueError):
+            ap = float(amount_precision)
+            if ap > 0:
+                if ap < 1:  # step size format (e.g. 1e-05 → 5 decimal places)
+                    decimal_places = max(0, int(round(-math.log10(ap))))
+                else:  # decimal places count format (e.g. 5)
+                    decimal_places = int(ap)
+                factor = 10 ** decimal_places
+                qty = math.floor(qty * factor) / factor
+        except (TypeError, ValueError, ZeroDivisionError):
             pass
 
     min_qty = amount_limits.get("min")

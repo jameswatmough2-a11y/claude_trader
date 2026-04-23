@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from apscheduler.triggers.interval import IntervalTrigger
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -50,6 +50,7 @@ class ConfigPayload(BaseModel):
     timezone: str = Field(default="UTC")
     display_currency: str = Field(default="USD")
     ohlcv_interval: str = Field(default="1h")
+    ohlcv_limit: int = Field(ge=10, le=500, default=50)
     taker_fee_rate: float = Field(ge=0.0, le=0.05, default=0.001)
 
 
@@ -82,6 +83,7 @@ async def put_config(payload: ConfigPayload, db: Session = Depends(get_db)) -> d
     row.timezone = payload.timezone.strip() or "UTC"
     row.display_currency = payload.display_currency.strip().upper() or "USD"
     row.ohlcv_interval = payload.ohlcv_interval.strip() or "1h"
+    row.ohlcv_limit = payload.ohlcv_limit
     row.taker_fee_rate = payload.taker_fee_rate
     row.updated_at = datetime.now(timezone.utc)
     db.commit()
@@ -141,6 +143,12 @@ def stop() -> dict:
 
 @router.post("/reset")
 def reset(db: Session = Depends(get_db)) -> dict:
+    if bot_state.cycle_active:
+        raise HTTPException(
+            status_code=409,
+            detail="A trading cycle is currently running. Wait for it to finish before resetting.",
+        )
+
     if bot_state.running:
         try:
             scheduler.remove_job("hourly_trading_cycle")
@@ -189,6 +197,7 @@ def _apply_settings(row: BotConfig) -> None:
     settings.paper_balance_usdt = row.paper_balance_usdt
     settings.model_name = row.model_name
     settings.ohlcv_interval = getattr(row, "ohlcv_interval", "1h") or "1h"
+    settings.ohlcv_limit = int(getattr(row, "ohlcv_limit", 50) or 50)
     settings.taker_fee_rate = getattr(row, "taker_fee_rate", 0.001) or 0.001
     if row.tracked_symbols:
         settings.tracked_symbols = [s.strip().upper() for s in row.tracked_symbols.split(",") if s.strip()]

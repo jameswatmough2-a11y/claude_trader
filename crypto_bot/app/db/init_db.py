@@ -26,6 +26,7 @@ def _migrate_bot_config() -> None:
         ("timezone", "VARCHAR NOT NULL DEFAULT 'UTC'"),
         ("display_currency", "VARCHAR NOT NULL DEFAULT 'USD'"),
         ("ohlcv_interval", "VARCHAR NOT NULL DEFAULT '1h'"),
+        ("ohlcv_limit", "INTEGER NOT NULL DEFAULT 50"),
         ("taker_fee_rate", "FLOAT NOT NULL DEFAULT 0.001"),
     ]
 

@@ -34,6 +34,7 @@ interface Config {
   timezone: string
   display_currency: string
   ohlcv_interval: string
+  ohlcv_limit: number
   taker_fee_rate: number
 }
 
@@ -51,6 +52,7 @@ const DEFAULTS: Config = {
   timezone: 'UTC',
   display_currency: 'USD',
   ohlcv_interval: '1h',
+  ohlcv_limit: 50,
   taker_fee_rate: 0.001,
 }
 
@@ -192,6 +194,7 @@ export default function SettingsPage() {
     timezone: (data.timezone as string) ?? DEFAULTS.timezone,
     display_currency: (data.display_currency as string) ?? DEFAULTS.display_currency,
     ohlcv_interval: (data.ohlcv_interval as string) ?? DEFAULTS.ohlcv_interval,
+    ohlcv_limit: (data.ohlcv_limit as number) ?? DEFAULTS.ohlcv_limit,
     taker_fee_rate: (data.taker_fee_rate as number) ?? DEFAULTS.taker_fee_rate,
   })
 
@@ -367,6 +370,15 @@ export default function SettingsPage() {
                     </button>
                   ))}
                 </div>
+              </SettingRow>
+            </div>
+
+            <div className="py-5">
+              <SettingRow
+                label="Candles Per Cycle"
+                description="How many candles to fetch and pass to the AI each cycle (10–500). More candles = more context but higher token cost."
+              >
+                <NumberInput value={config.ohlcv_limit} onChange={setNum('ohlcv_limit')} min={10} max={500} step={10} disabled={td} />
               </SettingRow>
             </div>
 

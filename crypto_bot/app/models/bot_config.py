@@ -31,6 +31,7 @@ class BotConfig(Base):
     timezone: Mapped[str] = mapped_column(String(50), nullable=False, default="UTC")
     display_currency: Mapped[str] = mapped_column(String(10), nullable=False, default="USD")
     ohlcv_interval: Mapped[str] = mapped_column(String(10), nullable=False, default="1h")
+    ohlcv_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=50)
     taker_fee_rate: Mapped[float] = mapped_column(Float, nullable=False, default=0.001)
 
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -51,6 +52,7 @@ class BotConfig(Base):
             "timezone": "UTC",
             "display_currency": "USD",
             "ohlcv_interval": "1h",
+            "ohlcv_limit": 50,
             "taker_fee_rate": 0.001,
         }
 
@@ -69,6 +71,7 @@ class BotConfig(Base):
             "timezone": self.timezone,
             "display_currency": self.display_currency,
             "ohlcv_interval": self.ohlcv_interval,
+            "ohlcv_limit": self.ohlcv_limit,
             "taker_fee_rate": self.taker_fee_rate,
             "updated_at": self.updated_at.isoformat(),
         }

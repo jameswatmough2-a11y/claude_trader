@@ -23,6 +23,7 @@ class Settings:
     take_profit_pct: float = field(default_factory=lambda: float(os.getenv("TAKE_PROFIT_PCT", "0")))
 
     ohlcv_interval: str = field(default_factory=lambda: os.getenv("OHLCV_INTERVAL", "1h"))
+    ohlcv_limit: int = field(default_factory=lambda: int(os.getenv("OHLCV_LIMIT", "50")))
     taker_fee_rate: float = field(default_factory=lambda: float(os.getenv("TAKER_FEE_RATE", "0.001")))
 
     def __post_init__(self) -> None:

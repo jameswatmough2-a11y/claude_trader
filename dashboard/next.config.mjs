@@ -10,6 +10,14 @@ const nextConfig = {
         source: '/api/chart/:path*',
         destination: 'http://localhost:8000/chart/:path*',
       },
+      {
+        source: '/api/logs/:path*',
+        destination: 'http://localhost:8000/logs/:path*',
+      },
+      {
+        source: '/api/logs',
+        destination: 'http://localhost:8000/logs',
+      },
     ]
   },
 }

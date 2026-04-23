@@ -104,6 +104,12 @@ export default function LogsPage() {
 
   useEffect(() => { fetchLogs() }, [fetchLogs])
 
+  // Auto-refresh every 15 s
+  useEffect(() => {
+    const id = setInterval(fetchLogs, 15000)
+    return () => clearInterval(id)
+  }, [fetchLogs])
+
   // Load filter options once
   useEffect(() => {
     fetch('/api/logs/components').then(r => r.ok ? r.json() : []).then(setComponents).catch(() => {})

@@ -70,6 +70,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     asyncio.create_task(ws_service.run_forever())
     asyncio.create_task(trigger_executor.run_forever())
+    asyncio.create_task(_prewarm_sentiment())
 
     scheduler.start()
     logger.info("Scheduler started — waiting for user to press Start")
@@ -78,6 +79,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     scheduler.shutdown(wait=False)
     logger.info("Bot stopped")
+
+
+async def _prewarm_sentiment() -> None:
+    import asyncio
+    from app.config import settings
+    from app.services.sentiment_service import get_all_sentiment
+
+    await asyncio.sleep(8)  # let WebSocket connect and stabilise first
+    try:
+        logger.info("Pre-warming sentiment cache for %s", settings.tracked_symbols)
+        await asyncio.to_thread(get_all_sentiment, settings.tracked_symbols)
+        logger.info("Sentiment cache pre-warmed")
+    except Exception:
+        logger.warning("Sentiment pre-warm failed — will fetch on first cycle")
 
 
 def _reconcile_live_positions() -> None:
