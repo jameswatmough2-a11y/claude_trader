@@ -53,7 +53,7 @@ function makeTzFormatter(iana: string) {
   }
 }
 
-function buildChartOptions(el: HTMLElement, tzFormatter: (t: number) => string) {
+function buildChartOptions(tzFormatter: (t: number) => string) {
   return {
     layout: {
       background: { type: ColorType.Solid, color: 'transparent' },
@@ -83,7 +83,7 @@ function buildChartOptions(el: HTMLElement, tzFormatter: (t: number) => string) 
     localization: {
       timeFormatter: tzFormatter,
     },
-    width: el.offsetWidth,
+    autoSize: true,
     height: 380,
   } as const
 }
@@ -166,7 +166,7 @@ export function CandlestickChart({
     if (!el) return
 
     const tzFormatter = makeTzFormatter(prefs.timezone)
-    const chart = createChart(el, buildChartOptions(el, tzFormatter))
+    const chart = createChart(el, buildChartOptions(tzFormatter))
     chartRef.current = chart
 
     const series = chart.addSeries(CandlestickSeries, {
@@ -201,11 +201,7 @@ export function CandlestickChart({
     })
     seriesRef.current = series
 
-    const ro = new ResizeObserver(() => chart.applyOptions({ width: el.offsetWidth }))
-    ro.observe(el)
-
     return () => {
-      ro.disconnect()
       chart.remove()
       chartRef.current = null
       seriesRef.current = null

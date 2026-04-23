@@ -3,11 +3,15 @@
 import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { Activity, Bot, LayoutDashboard, RefreshCw, Settings, Zap } from 'lucide-react'
+import { Activity, Bot, Clock, LayoutDashboard, Moon, Settings, Sun, Zap } from 'lucide-react'
+import { useTheme } from 'next-themes'
 
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
 import { cn } from '@/lib/utils'
+import { TIMEZONES } from '@/lib/display-prefs'
+import { useDisplayPrefs } from '@/app/providers/display-prefs-provider'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -18,20 +22,7 @@ interface Health {
   model: string
 }
 
-interface LatestDecision {
-  snapshot_time: string
-}
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-function fmtCycleTime(iso: string) {
-  return new Date(iso).toLocaleString(undefined, {
-    month: 'short',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-  })
-}
 
 function NavLink({
   href,
@@ -64,18 +55,35 @@ function NavLink({
 export function AppSidebar() {
   const [health, setHealth] = useState<Health | null>(null)
   const [online, setOnline] = useState<boolean | null>(null)
-  const [lastCycle, setLastCycle] = useState<string | null>(null)
+  const [now, setNow] = useState<Date | null>(null)
+
+  const { prefs } = useDisplayPrefs()
+  const { resolvedTheme, setTheme } = useTheme()
+  const [themeMounted, setThemeMounted] = useState(false)
+  useEffect(() => setThemeMounted(true), [])
+  const tzLabel = TIMEZONES.find(t => t.iana === prefs.timezone)?.label ?? prefs.timezone
+
+  // Live clock — synced to the next exact second boundary
+  useEffect(() => {
+    setNow(new Date())
+    let intervalId: ReturnType<typeof setInterval>
+    const timeoutId = setTimeout(() => {
+      setNow(new Date())
+      intervalId = setInterval(() => setNow(new Date()), 1000)
+    }, 1000 - (Date.now() % 1000))
+    return () => { clearTimeout(timeoutId); clearInterval(intervalId) }
+  }, [])
+
+  const clockTime = now
+    ? now.toLocaleTimeString('en', { timeZone: prefs.timezone, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
+    : '--:--:--'
 
   useEffect(() => {
     async function load() {
       try {
-        const [h, decisions]: [Health, LatestDecision[]] = await Promise.all([
-          fetch('/api/bot/health').then(r => { if (!r.ok) throw new Error(); return r.json() }),
-          fetch('/api/bot/decisions?limit=1').then(r => r.json()),
-        ])
+        const h: Health = await fetch('/api/bot/health').then(r => { if (!r.ok) throw new Error(); return r.json() })
         setHealth(h)
         setOnline(true)
-        if (decisions.length > 0) setLastCycle(decisions[0].snapshot_time)
       } catch {
         setOnline(false)
         setHealth(null)
@@ -173,25 +181,30 @@ export function AppSidebar() {
             </div>
           </>
         )}
+
       </div>
 
-      {/* ── Last cycle ─────────────────────────────────────────────────── */}
-      {lastCycle && (
-        <>
-          <Separator />
-          <div className="flex flex-col gap-1 p-4">
-            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              <RefreshCw className="size-3" />
-              Last cycle
-            </div>
-            <p className="font-mono text-xs text-foreground">{fmtCycleTime(lastCycle)}</p>
-          </div>
-        </>
-      )}
-
-      {/* ── Footer ─────────────────────────────────────────────────────── */}
-      <div className="mt-auto p-4">
-        <p className="text-xs text-muted-foreground">Auto-refresh every 30 s</p>
+      {/* ── Live clock + theme toggle ───────────────────────────────────── */}
+      <Separator />
+      <div className="flex flex-col gap-2 p-4">
+        <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+          <Clock className="size-3" />
+          <span>{tzLabel}</span>
+        </div>
+        <p className="font-mono text-lg tabular-nums leading-none tracking-tight">
+          {clockTime}
+        </p>
+        {themeMounted && (
+          <Button
+            variant="ghost" size="sm"
+            className="mt-1 w-full justify-start gap-2 text-muted-foreground"
+            onClick={() => setTheme(resolvedTheme === 'dark' ? 'light' : 'dark')}
+          >
+            {resolvedTheme === 'dark'
+              ? <><Sun className="size-4" /> Light mode</>
+              : <><Moon className="size-4" /> Dark mode</>}
+          </Button>
+        )}
       </div>
     </aside>
   )

@@ -65,7 +65,10 @@ export function DisplayPrefsProvider({ children }: { children: React.ReactNode }
   const cvtPrice = useCallback((usd: number) => usd * currency.rate, [currency.rate])
 
   const fmtTime = useCallback((iso: string) => {
-    return new Date(iso).toLocaleString('en', {
+    // SQLite returns naive ISO strings (no Z/offset) — JS would parse as local time.
+    // Force UTC interpretation so timezone conversion is always correct.
+    const utc = /[Z+]/.test(iso) ? iso : iso + 'Z'
+    return new Date(utc).toLocaleString('en', {
       timeZone: prefs.timezone,
       month: 'short',
       day: 'numeric',

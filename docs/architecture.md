@@ -251,7 +251,7 @@ TradingCycleService.run()
 
 ## Dashboard (Next.js Frontend)
 
-The dashboard is a **Next.js 14 App Router** application in the `dashboard/` directory. It communicates with the FastAPI backend via REST (`/api/...` proxied by Next.js) and displays real-time data via a 30-second auto-refresh and WebSocket streaming for the candlestick chart.
+The dashboard is a **Next.js App Router** application in the `dashboard/` directory. It communicates with the FastAPI backend via REST (`/api/...` proxied by Next.js) and displays real-time data via a 30-second auto-refresh and WebSocket streaming for the candlestick chart.
 
 ### Key components
 
@@ -268,31 +268,48 @@ Preferences are persisted to `localStorage` and loaded on mount to avoid SSR hyd
 **`app/components/dashboard.tsx`** — Main overview page. Fetches from `/api/status`, `/api/config`, `/api/decisions`, `/api/positions`, and `/api/assets`. Uses `fmtTime` and `cvtPrice` from the display prefs context for all visible timestamps and monetary values.
 
 **`app/components/candlestick-chart.tsx`** — Lightweight-charts candlestick chart with:
-- Real-time data from Binance WebSocket (via backend streaming)
-- Three price lines: Entry (yellow, dotted), Stop Loss (red, dashed), Take Profit (green, dashed)
+- `autoSize: true` — chart fills its container width automatically; no manual `ResizeObserver` required
+- Real-time data from Binance WebSocket (via backend streaming); `timeScale().fitContent()` called after each history load
+- Three price lines: Entry (yellow `#eab308`, dotted), Stop Loss (red, dashed), Take Profit (green, dashed)
 - Toggle buttons for each price line
 - `autoscaleInfoProvider` that expands the chart's visible range to always include SL/TP levels
 - Position info row: entry price, SL with % distance, TP with % distance, R/R ratio
 - Timezone-aware time axis via `chart.applyOptions({ localization: { timeFormatter } })`
-- Price line titles are short labels (`'Entry'`, `'SL'`, `'TP'`) — the right-axis label shows the price
 
-**`app/settings/page.tsx`** — Settings in two sections with two independent save bars:
-- **Trading Settings** — risk parameters, symbols, paper trading, model. Save is disabled while the bot is running. Shows a lock banner when locked.
-- **Display Settings** — chart interval, timezone, currency. Save is always enabled (bot running or stopped). Changes require clicking Save — they do not apply instantly.
+**`app/settings/page.tsx`** — Flat two-column layout with a single SaveBar:
+- **AI Model** column — `model_name`, `interval_minutes`, `min_confidence`
+- **Trading** column — `tracked_symbols`, position sizing, risk parameters, paper balance
+- **Display** row (full width) — `chart_interval`, `display_currency`, `timezone`
+- Bot running: AI Model and Trading fields locked (disabled + lock icon on heading); only Display fields editable. Save sends display values merged onto last saved config.
+- Bot stopped: all fields editable; Save sends full config.
 
 **`lib/display-prefs.ts`** — Display preference types, currency/timezone lists, exchange rates, localStorage helpers.
 
 ### Display preferences system
 
-Currency and timezone are display-only — the backend always works in USD and UTC. Conversion and formatting happen entirely in the browser:
+**Currency.** The backend always operates in USDT and raw crypto quantities. Every monetary value returned by the API — `wallet_balance`, `entry_price`, `execution_price`, `unrealized_pnl` — is in USD (USDT). No currency conversion occurs server-side. The display currency and its symbol are applied in the browser by `cvtPrice(usd)` from `DisplayPrefsProvider`:
 
 ```
-Backend response: { wallet_balance: 10000.0, time: "2026-04-23T01:34:00Z" }
-                           ↓ cvtPrice(10000.0)        ↓ fmtTime("2026-04-23T01:34:00Z")
-Dashboard shows:  £7,900.00                            Apr 23, 01:34
+Backend:   wallet_balance = 10000.0  (USDT)
+Browser:   cvtPrice(10000.0) → 7900.0   currencySymbol → '£'
+UI shows:  £7,900.00
 ```
 
-Exchange rates are hardcoded constants in `lib/display-prefs.ts` (no live FX feed). Timezone formatting uses the browser's `Intl` API with the IANA timezone string.
+Exchange rates are hardcoded constants in `lib/display-prefs.ts` — there is no live FX feed.
+
+**Timezone.** All timestamps stored in the database are produced by Python's `datetime.utcnow()`. SQLite persists these as ISO 8601 strings **without a timezone suffix** (e.g. `"2026-04-23T01:34:00"`). JavaScript's `Date` constructor interprets bare ISO strings as *local time* per spec, not UTC — this produces a wrong result on any machine not in the UTC timezone.
+
+`fmtTime` in `DisplayPrefsProvider` corrects this by appending `Z` when no timezone designator is present:
+
+```tsx
+// SQLite returns naive ISO strings — JS parses them as local time without this fix.
+const utc = /[Z+]/.test(iso) ? iso : iso + 'Z'
+return new Date(utc).toLocaleString('en', { timeZone: prefs.timezone, ... })
+```
+
+`Z` forces UTC interpretation; `toLocaleString` with the IANA string then converts to the user's chosen timezone. Every component that renders a timestamp calls `fmtTime` — the fix is applied once and propagates to all views.
+
+Changing the display timezone in the dashboard does **not** affect the backend. Python always logs UTC, SQLite always stores naive strings, and the API always returns them unchanged. The `timezone` field in `bot_config` is read by `DisplayPrefsProvider` on load to synchronise preferences across browser sessions; it is never read by any trading service.
 
 ---
 

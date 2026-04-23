@@ -31,6 +31,47 @@ A new `SessionLocal()` instance is created for each hourly cycle in `run_hourly_
 
 ## ORM Models
 
+### `BotConfig`
+
+```
+bot_config
+├── id                      INTEGER   PRIMARY KEY (always 1 — single-row table)
+├── interval_minutes        INTEGER   (default 60)
+├── min_confidence          NUMERIC(5,4)  (default 0.7)
+├── max_position_pct        NUMERIC(10,4) (default 20.0)
+├── max_total_exposure_pct  NUMERIC(10,4) (default 60.0)
+├── stop_loss_pct           NUMERIC(10,4) (default 5.0)
+├── take_profit_pct         NUMERIC(10,4) (default 0.0)
+├── tracked_symbols         VARCHAR   (default "BTCUSDT,ETHUSDT,SOLUSDT")
+├── paper_balance_usdt      NUMERIC(20,8) (default 10000)
+├── chart_interval          VARCHAR   (default "1m")
+├── model_name              VARCHAR   (default "claude-sonnet-4-6")
+├── timezone                VARCHAR   (default "UTC")
+├── display_currency        VARCHAR   (default "USD")
+└── updated_at              DATETIME  NULLABLE
+```
+
+This is a **single-row config table** — `id` is always `1`. `PUT /api/bot/config` upserts this row using `INSERT OR REPLACE`.
+
+`timezone` and `display_currency` are display-only fields — they are not used by any trading service. They are read by the dashboard's `DisplayPrefsProvider` on load (via `GET /api/bot/config`) to synchronise the user's display preferences across browser sessions.
+
+`chart_interval` is also display-only — used to set the default timeframe on the candlestick chart when the dashboard loads.
+
+**`_apply_settings(row)`** in `bot_control.py` mutates the live `settings` singleton whenever config is saved:
+
+```python
+settings.interval_minutes       = row.interval_minutes
+settings.min_confidence         = row.min_confidence
+settings.tracked_symbols        = [s.strip().upper() for s in row.tracked_symbols.split(",")]
+# ... etc
+```
+
+This means all trading services (AI, risk, execution) pick up new values immediately without restart. Display fields (`timezone`, `display_currency`, `chart_interval`) are not copied into `settings` — they are passed straight through to the dashboard via `to_dict()`.
+
+**Schema migrations** are handled by `_migrate_bot_config()` in `init_db.py` — uses `inspect(engine)` to check existing columns and issues `ALTER TABLE ADD COLUMN` for any that are missing. This allows zero-downtime upgrades: start the server with a new version, the migration runs automatically on startup.
+
+---
+
 ### `Asset`
 
 ```
@@ -206,6 +247,7 @@ This means stop-loss and take-profit checks resume correctly after a restart for
 
 | Data | Survives restart? | Notes |
 |---|---|---|
+| Bot configuration | **Yes** | `bot_config` row (id=1); `_apply_settings()` reapplies on startup |
 | Asset records | Yes | DB is persistent |
 | Market snapshots (historical) | Yes | DB is persistent |
 | Position wallet-balance records | Yes | DB is persistent (but these aren't live position state) |

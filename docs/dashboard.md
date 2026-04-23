@@ -47,7 +47,7 @@ The app uses a persistent sidebar layout defined in `app/layout.tsx`:
 └──────────┴─────────────────────────────────────────────┘
 ```
 
-The sidebar is hidden on screens below `md` breakpoint (768 px).
+On screens below `md` (768 px) the sidebar is replaced by a top bar with a hamburger button that opens a full-height slide-in drawer (`app/components/mobile-nav.tsx`). The drawer closes automatically on navigation and locks body scroll while open.
 
 ---
 
@@ -55,16 +55,22 @@ The sidebar is hidden on screens below `md` breakpoint (768 px).
 
 ```
 app/
-  layout.tsx                  # Root layout — fonts, ThemeProvider, sidebar shell
-  page.tsx                    # Composes Dashboard + CandlestickChart
+  layout.tsx                  # Root layout — fonts, ThemeProvider, sidebar + MobileNav shell
+  page.tsx                    # Root redirect → /overview
+  overview/page.tsx           # Composes Dashboard + CandlestickChart
+  settings/page.tsx           # Settings page
   components/
-    app-sidebar.tsx           # Sidebar: brand, nav, bot status, last cycle
+    app-sidebar.tsx           # Sidebar: brand, nav, bot status, live clock, theme toggle
+    mobile-nav.tsx            # Mobile top-bar + slide-in drawer (md:hidden)
     dashboard.tsx             # Stats cards, decisions table, positions, assets
     candlestick-chart.tsx     # TradingView candlestick chart (live + historical)
+  providers/
+    display-prefs-provider.tsx # Global timezone/currency context
 hooks/
   use-chart-ws.ts             # WebSocket hook with reconnect backoff
 lib/
   chart-utils.ts              # fmtPrice, fmtChange, autoDecimals
+  display-prefs.ts            # CURRENCIES, TIMEZONES, exchange rates, localStorage helpers
   utils.ts                    # shadcn cn() helper
 ```
 
@@ -99,16 +105,18 @@ The chart component is the most complex piece. Key design decisions:
 
 **No rerender per tick.** The TradingView chart instance is stored in a `useRef`, not state. WebSocket candle updates call `series.update()` directly on the chart ref — React never rerenders the component on price ticks.
 
+**Auto-sizing.** The chart is created with `autoSize: true`. Lightweight Charts internally observes the container element and updates the canvas width whenever the layout changes. No manual `ResizeObserver` or `width: el.offsetWidth` is needed — the chart always fills its container regardless of viewport width.
+
 **Two data sources, two roles:**
-- REST `GET /api/chart/history` — loads the full historical OHLCV dataset on mount and on symbol/timeframe change
+- REST `GET /api/chart/history` — loads the full historical OHLCV dataset on mount and on symbol/timeframe change; `timeScale().fitContent()` is called immediately after to fill all candles across the visible range
 - WebSocket `/ws/chart` — streams the current live candle at ~5 Hz, updating the rightmost bar in place
 
 **Price lines.** When a position is open, three horizontal `IPriceLine` objects are drawn on the series:
-- Entry (dotted, slate)
-- Stop loss (dashed, red)
-- Take profit (dashed, green) — only if `take_profit_price` is non-null
+- Entry (yellow `#eab308`, dotted) — title `'Entry'`
+- Stop loss (red `#ef4444`, dashed) — title `'SL'`
+- Take profit (green `#22c55e`, dashed) — title `'TP'`; only if `take_profit_price` is non-null
 
-Price lines are cleared and redrawn whenever a `position` WS message arrives or the symbol changes.
+Titles are short labels — the right-axis label shows the exact price. Price lines are cleared and redrawn whenever a `position` WS message arrives or the symbol changes.
 
 **Symbol list** is fetched from `GET /api/bot/health` on mount and populates the symbol tabs. If the current symbol is not in the tracked list, it falls back to the first symbol.
 
@@ -128,14 +136,83 @@ The hook manages a single WebSocket connection per `(symbol, interval)` pair. Wh
 
 ## Sidebar (`app-sidebar.tsx`)
 
-Polls `GET /api/bot/health` and `GET /api/bot/decisions?limit=1` every 30 seconds to display:
+Polls `GET /api/bot/health` every 30 seconds to display:
 - Paper / Live mode badge
-- Online / Offline status (green dot or red)
+- Online / Offline status (animated green dot or red)
 - Model name (stripped `claude-` prefix)
 - Tracked symbols as small badges
-- Last trading cycle timestamp
+- Live clock — second-accurate, synced to the next exact second boundary via `setTimeout(1000 - Date.now() % 1000)` then `setInterval(1000)`; displayed in the user's selected timezone using `prefs.timezone` from `DisplayPrefsProvider`
 
-No interaction — display only.
+The clock and theme toggle share the same bottom section. The dark/light mode toggle is displayed directly below the clock readout. Theme rendering is guarded by a `mounted` state to avoid SSR hydration mismatch with `next-themes`.
+
+On mobile (`md:hidden`) the sidebar is replaced by `MobileNav`, which provides a top bar with the brand name and a hamburger button. Tapping the hamburger slides in a full-height drawer from the left with the same nav links.
+
+---
+
+## Settings Page (`app/settings/page.tsx`)
+
+The settings page uses a flat, card-free layout split into three sections:
+
+```
+┌────────────────────┐  ┌────────────────────────────────────┐
+│  AI MODEL          │  │  TRADING                           │
+│  ─────────────     │  │  ──────────                        │
+│  Model             │  │  Tracked Symbols                   │
+│  Reanalysis Interval│  │  Max Position Size (%)             │
+│  Min Confidence    │  │  Max Total Exposure (%)            │
+│                    │  │  Stop Loss (%)                     │
+│                    │  │  Take Profit (%)                   │
+│                    │  │  Paper Balance (USDT)              │
+└────────────────────┘  └────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│  DISPLAY                                                    │
+│  Chart Interval          Currency         Timezone          │
+└─────────────────────────────────────────────────────────────┘
+
+[Unsaved changes]                          [Revert]  [Save]
+```
+
+The two upper columns (`AI Model` and `Trading`) use `grid-cols-2` on `md+` and collapse to a single column on mobile. The `Display` row uses `grid-cols-3` on `sm+`.
+
+**Single SaveBar.** There is one save button at the bottom covering all three sections.
+
+**Lock behaviour:**
+- **Bot not running** — all fields editable. Save sends the full config object. Revert restores all fields.
+- **Bot running** — only the three Display fields (`chart_interval`, `timezone`, `display_currency`) are editable; AI Model and Trading fields are disabled. A lock icon appears next to the `AI MODEL` and `TRADING` section headings and an amber banner explains the lock. Save sends `{ ...savedTrading, chart_interval, timezone, display_currency }`, preserving trading values from the last saved state. Revert restores only the Display fields.
+
+`isDirty` is computed differently depending on lock state — when locked it only checks the three display keys; when unlocked it checks all keys. This ensures the Save/Revert buttons remain inactive when the user cannot change anything meaningful.
+
+Display preferences (`timezone`, `display_currency`) are applied globally via `DisplayPrefsProvider` immediately after a successful save.
+
+---
+
+## Bot Controls
+
+The Overview page (`app/overview/page.tsx`) includes three bot control buttons rendered by `dashboard.tsx`:
+
+- **Start** — starts the hourly trading cycle. APScheduler fires one cycle immediately, then continues on the configured interval.
+- **Stop** — pauses the scheduler. Open positions are not closed; stop-loss and take-profit still resume on the next start.
+- **Reset DB** — drops and recreates all database tables, clearing all trade history and resetting the paper balance. **This button is disabled while the bot is running** — `status.running` must be `false`. This prevents resetting the database mid-cycle and losing in-flight execution state.
+
+---
+
+## Timezone Handling
+
+All timestamps stored in the database are produced by Python's `datetime.utcnow()`. SQLite has no native datetime type — it persists these as ISO 8601 strings **without a timezone suffix** (e.g. `"2026-04-23T01:34:00"`).
+
+**The problem:** JavaScript's `Date` constructor interprets bare ISO strings (no `Z` or `+offset`) as *local time*, not UTC. On a machine in BST (UTC+1), `new Date("2026-04-23T01:34:00")` → 01:34 BST = 00:34 UTC. Displaying it in any timezone will be one hour off.
+
+**The fix:** `fmtTime` in `DisplayPrefsProvider` detects the missing designator and appends `Z` before constructing the `Date`:
+
+```tsx
+const utc = /[Z+]/.test(iso) ? iso : iso + 'Z'
+new Date(utc).toLocaleString('en', { timeZone: prefs.timezone, ... })
+```
+
+`Z` forces UTC interpretation; `toLocaleString` with the IANA timezone string then converts to whatever the user has selected. Every component that renders a timestamp — the decisions table, positions table, any future views — calls `fmtTime` from `useDisplayPrefs()`. The fix is in one place and propagates everywhere.
+
+The backend itself never changes: Python always logs UTC, SQLite always stores the naive string, and the API always returns the naive string. The timezone setting has no effect on the backend — it is purely a display preference applied in the browser.
 
 ---
 

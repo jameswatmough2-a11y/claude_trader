@@ -279,12 +279,12 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
   const shownPositions = positionView === 'latest' ? latestPositions : allPositions
 
   return (
-    <div className="mx-auto flex min-h-screen max-w-7xl flex-col gap-6 p-6">
+    <div className="flex min-h-screen flex-col gap-4 p-4 md:gap-6 md:p-6">
 
       {/* ── Header ─────────────────────────────────────────────────────── */}
       <div className="flex items-center justify-between">
         <h1 className="text-base font-semibold">Overview</h1>
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2">
           {lastUpdated && (
             <span className="hidden text-xs text-muted-foreground sm:block">
               Updated {fmtTime(lastUpdated.toISOString())}
@@ -292,7 +292,7 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
           )}
           <Button variant="outline" size="sm" onClick={() => load(true)} disabled={refreshing}>
             <RefreshCw data-icon="inline-start" className={cn(refreshing && 'animate-spin')} />
-            Refresh
+            <span className="hidden sm:inline">Refresh</span>
           </Button>
         </div>
       </div>
@@ -302,7 +302,7 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
         'border',
         data?.status.running ? 'border-green-500/40 bg-green-500/5' : 'border-muted',
       )}>
-        <CardContent className="flex flex-wrap items-center justify-between gap-3 py-3">
+        <CardContent className="flex flex-col gap-3 py-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
           <div className="flex items-center gap-2.5">
             <span className={cn(
               'size-2 rounded-full',
@@ -335,7 +335,7 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
               variant="destructive"
               size="sm"
               onClick={() => botControl('reset')}
-              disabled={loading || botAction !== null}
+              disabled={loading || !!data?.status.running || botAction !== null}
             >
               <RotateCcw data-icon="inline-start" />
               Reset DB
@@ -357,7 +357,7 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
       )}
 
       {/* ── Stats row ──────────────────────────────────────────────────── */}
-      <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 md:gap-4 lg:grid-cols-4">
         <StatCard
           title="Symbols"
           value={data?.health.tracked_symbols.join(' · ') ?? null}
@@ -448,7 +448,7 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
                 <TableHead>Action</TableHead>
                 <TableHead>Confidence</TableHead>
                 <TableHead className="hidden md:table-cell">Reasoning</TableHead>
-                <TableHead className="hidden text-right sm:table-cell">Time</TableHead>
+                <TableHead className="hidden sm:table-cell">Time</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -480,7 +480,7 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
                     <TableCell className="hidden max-w-sm text-sm text-muted-foreground md:table-cell">
                       <span className="line-clamp-1">{d.reasoning_summary ?? '—'}</span>
                     </TableCell>
-                    <TableCell className="hidden whitespace-nowrap text-right text-xs text-muted-foreground tabular-nums sm:table-cell">
+                    <TableCell className="hidden whitespace-nowrap text-xs text-muted-foreground tabular-nums sm:table-cell">
                       {fmtTime(d.snapshot_time)}
                     </TableCell>
                   </TableRow>
@@ -615,9 +615,8 @@ export function Dashboard({ priceChart }: { priceChart?: React.ReactNode }) {
       </div>
 
       {/* ── Footer ─────────────────────────────────────────────────────── */}
-      <p className="pb-4 text-center text-xs text-muted-foreground">
-        Auto-refreshes every 30 seconds · Press{' '}
-        <kbd className="rounded bg-muted px-1 font-mono text-xs">d</kbd> to toggle dark mode
+      <p className="pb-2 text-center text-xs text-muted-foreground">
+        Auto-refreshes every 30 seconds
       </p>
 
     </div>

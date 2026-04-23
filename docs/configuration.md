@@ -283,19 +283,45 @@ Changing to PostgreSQL or MySQL requires also removing the `connect_args` in `se
 
 ## Dashboard Settings UI
 
-Most settings can also be changed through the dashboard's **Settings page** (`/settings`) without editing `.env` directly. The page splits settings into two sections:
+Most settings can be changed through the dashboard's **Settings page** (`/settings`) without editing `.env` directly. The page is organised into three sections and has a single Save/Revert bar at the bottom.
 
-### Trading Settings
-All risk and trading parameters (everything except `DATABASE_URL`). Saved via `PATCH /api/config`. **Disabled while the bot is running** — you must stop the bot first to edit these.
+### AI Model
+| Field | Key |
+|---|---|
+| Model | `model_name` |
+| Reanalysis Interval | `interval_minutes` |
+| Min Confidence | `min_confidence` |
 
-### Display Settings
-Chart interval, timezone, and currency. Saved via the same `PATCH /api/config` endpoint. These can be changed at any time, even while the bot is running.
+### Trading
+| Field | Key |
+|---|---|
+| Tracked Symbols | `tracked_symbols` |
+| Max Position Size (%) | `max_position_pct` |
+| Max Total Exposure (%) | `max_total_exposure_pct` |
+| Stop Loss (%) | `stop_loss_pct` |
+| Take Profit (%) | `take_profit_pct` |
+| Paper Balance (USDT) | `paper_balance_usdt` |
 
-The dashboard settings page reads the current config on load (`GET /api/config`) and shows a save bar when you have unsaved changes.
+### Display
+| Field | Key | Always editable? |
+|---|---|---|
+| Chart Interval | `chart_interval` | Yes |
+| Currency | `display_currency` | Yes |
+| Timezone | `timezone` | Yes |
+
+**While the bot is running**, the AI Model and Trading sections are locked (fields disabled, lock icon on section heading). Only Display fields can be changed. The single Save button sends only those three values merged onto the last saved config, leaving trading values unchanged.
+
+**While the bot is stopped**, all fields are editable and Save sends the full config.
+
+Changes require clicking Save — nothing is applied instantly. Display preferences (timezone and currency) are applied globally across the UI immediately after a successful save.
 
 ---
 
 ## How Settings Are Loaded
+
+There are two layers of configuration that are merged on startup:
+
+### Layer 1 — `.env` file (initial defaults)
 
 `app/config.py`:
 ```python
@@ -305,13 +331,31 @@ class Settings:
         default_factory=lambda: os.getenv("PAPER_TRADING", "true").lower() == "true"
     )
     # ... all other fields follow the same pattern
-    
+
 settings = Settings()
 ```
 
-`load_dotenv()` is called at the top of `config.py`, which reads `.env` from the working directory. All `os.getenv()` calls in the `default_factory` lambdas then pick up the loaded values.
+`load_dotenv()` is called at the top of `config.py`. The `settings` singleton is created once at import time with values from the environment.
 
-The `settings` singleton is created once at import time. The only exception is `KILL_SWITCH`, which is read via `os.getenv()` directly at call time in `risk_service.py` — not from `settings` — enabling hot-reload.
+`KILL_SWITCH` is the only exception — it is read via `os.getenv()` at call time in `risk_service.py`, not from `settings`, enabling hot-reload without restart.
+
+### Layer 2 — `bot_config` database row (overrides `.env`)
+
+On server startup, `main.py` calls `_apply_settings(row)` if a `bot_config` row exists. This mutates the live `settings` singleton so all services immediately use the persisted values instead of the `.env` defaults:
+
+```python
+# Startup sequence in main.py lifespan:
+init_db()
+row = db.query(BotConfig).filter_by(id=1).first()
+if row:
+    _apply_settings(row)   # overwrite .env-loaded settings with DB values
+```
+
+`_apply_settings` is also called after every successful `PUT /api/bot/config`, so changes take effect immediately without restart.
+
+**Precedence:** DB row > `.env` file > hardcoded dataclass defaults.
+
+**Display fields** (`timezone`, `display_currency`, `chart_interval`) are stored in `bot_config` but are NOT copied into `settings` — they are display-only and only returned to the dashboard via `GET /api/bot/config`. All trading logic uses USD and UTC internally regardless of these settings.
 
 ---
 
