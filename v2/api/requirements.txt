@@ -1,0 +1,28 @@
+# Core
+fastapi
+uvicorn[standard]
+sqlalchemy
+pydantic
+pydantic-settings
+python-dotenv
+
+# AI + market data
+anthropic
+ccxt
+websockets
+httpx
+
+# Scheduling
+apscheduler
+
+# Auth (Clerk JWT validation via JWKS)
+pyjwt[crypto]
+
+# Sentiment (ported from v1 — keep in sync)
+feedparser
+praw
+textblob
+
+# Dev
+pytest
+pytest-asyncio
